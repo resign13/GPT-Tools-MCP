@@ -2,7 +2,7 @@
 name: mcp-probe-kit
 description: >-
   在已配置 mcp-probe-kit 的项目中，于新功能、Bug、UI、重构或提交前读取；区分独立能力与完整交付编排，汇总当前对话构造完整参数，并在不确定首工具时提供 workflow 兜底。完整新功能由 start_feature 选择 flat 或 parent-child Spec；Skill 不承担中央意图识别，start_* 只组合当前场景实际需要的能力。
-mcp-probe-kit-version: "4.0.0-rc.20"
+mcp-probe-kit-version: "4.0.0"
 ---
 
 # MCP 调用时机 — mcp-probe-kit
@@ -49,16 +49,16 @@ CLI 返回 JSON；读取 `structuredContent`、`content` 和 `isError`，继续�
 Windows：
 
 ```powershell
-npx.cmd --yes mcp-probe-kit@4.0.0-rc.20 install-agent --project-root .
+npx.cmd --yes mcp-probe-kit@4.0.0 install-agent --project-root .
 ```
 
 macOS / Linux：
 
 ```bash
-npx --yes mcp-probe-kit@4.0.0-rc.20 install-agent --project-root .
+npx --yes mcp-probe-kit@4.0.0 install-agent --project-root .
 ```
 
-安装后立即改用项目内启动器。不得使用 `@latest` 或 `@next`，不得全局安装，也不得修改用户项目的 `package.json`。Skill、CLI 启动器和 MCP 必须保持同一精确版本 `4.0.0-rc.20`。
+安装后立即改用项目内启动器。不得使用 `@latest` 或 `@next`，不得全局安装，也不得修改用户项目的 `package.json`。Skill、CLI 启动器和 MCP 必须保持同一精确版本 `4.0.0`。
 
 ### GitNexus 托管运行时
 
@@ -240,5 +240,5 @@ macOS / Linux：
 
 ---
 
-*mcp-probe-kit 按版本自动同步（当前 `4.0.0-rc.20`）。路径：`.agents/skills/mcp-probe-kit/SKILL.md`*
+*mcp-probe-kit 按版本自动同步（当前 `4.0.0`）。路径：`.agents/skills/mcp-probe-kit/SKILL.md`*
 

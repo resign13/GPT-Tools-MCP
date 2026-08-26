@@ -157,10 +157,6 @@
     void save();
   }}
 >
-  <p class="text-xs text-[var(--color-text-muted)]">
-    复制 Client ID / 密钥等请用上方「GPT 配置」卡片；此处可修改认证类型与重新生成密钥。
-  </p>
-
   <label class="grid gap-1">
     <span class="text-xs text-[var(--color-text-muted)]">认证类型</span>
     <select

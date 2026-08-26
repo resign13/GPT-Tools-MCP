@@ -40,9 +40,77 @@ pub fn update_workspace(state: State<'_, AppState>, profile: WorkspaceProfile) -
             .get(&profile.id)
             .cloned()
             .ok_or_else(|| AppError::Message(format!("workspace not found: {}", profile.id)))?;
+        validate_gateway_allowlist(store.list(), &profile)?;
         validate_workspace_resources_update(store.list(), &current, &profile)?;
         store.update(profile)
     })
+}
+
+fn validate_gateway_allowlist(
+    profiles: &[WorkspaceProfile],
+    profile: &WorkspaceProfile,
+) -> AppResult<()> {
+    let configured = profile.gateway.enabled || !profile.gateway.workspace_ids.is_empty();
+    if !configured {
+        return Ok(());
+    }
+    if !profile
+        .gateway
+        .workspace_ids
+        .iter()
+        .any(|id| id == &profile.id)
+    {
+        return Err(AppError::Message(
+            "gateway host workspace must be present in workspace_ids".into(),
+        ));
+    }
+    for workspace_id in &profile.gateway.workspace_ids {
+        if profiles
+            .iter()
+            .all(|candidate| candidate.id != *workspace_id)
+        {
+            return Err(AppError::Message(format!(
+                "gateway workspace not found: {workspace_id}"
+            )));
+        }
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::validate_gateway_allowlist;
+    use crate::error::AppError;
+    use crate::workspace::WorkspaceProfile;
+
+    fn profile(id: &str) -> WorkspaceProfile {
+        let mut profile = WorkspaceProfile::new(format!("C:/workspace/{id}"), Some(id.into()));
+        profile.id = id.into();
+        profile
+    }
+
+    #[test]
+    fn gateway_allowlist_requires_existing_host_and_targets() {
+        let host = profile("host");
+        let target = profile("target");
+        let profiles = vec![host.clone(), target];
+        let mut configured = host.clone();
+        configured.gateway.enabled = true;
+        configured.gateway.workspace_ids = vec!["host".into(), "target".into()];
+        assert!(validate_gateway_allowlist(&profiles, &configured).is_ok());
+
+        configured.gateway.workspace_ids.push("deleted".into());
+        assert!(matches!(
+            validate_gateway_allowlist(&profiles, &configured),
+            Err(AppError::Message(message)) if message.contains("deleted")
+        ));
+    }
+
+    #[test]
+    fn legacy_disabled_empty_gateway_remains_saveable() {
+        let host = profile("host");
+        assert!(validate_gateway_allowlist(std::slice::from_ref(&host), &host).is_ok());
+    }
 }
 
 #[tauri::command]

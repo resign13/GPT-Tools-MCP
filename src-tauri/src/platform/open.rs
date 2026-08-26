@@ -103,7 +103,7 @@ mod tests {
 
     #[test]
     fn allows_http_and_https() {
-        assert!(is_allowed_url("https://github.com/mybolide/coding-tools-mcp"));
+        assert!(is_allowed_url("https://github.com/resign13/GPT-Tools-MCP"));
         assert!(is_allowed_url("http://example.com/path"));
         assert!(is_allowed_url("  HTTPS://Example.COM  "));
     }

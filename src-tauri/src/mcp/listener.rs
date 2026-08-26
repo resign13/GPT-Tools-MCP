@@ -2,7 +2,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use axum::extract::{Form, Query, State};
-use axum::http::{header::CACHE_CONTROL, HeaderMap, StatusCode};
+use axum::http::{header::CACHE_CONTROL, HeaderMap, HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
@@ -11,15 +11,19 @@ use tokio::sync::oneshot;
 use tower_http::cors::CorsLayer;
 
 use crate::auth::{
-    authorization_server_metadata, authorize_get, authorize_post, external_base_url,
-    protected_resource_metadata, token_exchange, verify_bearer_header, verify_oauth_bearer_header,
-    AuthorizeForm, AuthorizeParams, OAuthRuntime, TokenForm,
+    authorization_server_metadata, authorize_get_with_workspace_names,
+    authorize_post_with_workspace_names, external_base_url, protected_resource_metadata,
+    token_exchange, verify_bearer_header, verify_oauth_bearer_header, AuthorizeForm,
+    AuthorizeParams, OAuthRuntime, TokenForm,
+};
+use crate::mcp::gateway::{
+    handle_gateway_request_with_source, rpc_error, GatewayRouter, SessionIdentifiers,
 };
 use crate::mcp::server::{handle_request, new_state, SharedState};
 use crate::secret::SecretStore;
+use crate::tools::policy::PolicySettings;
 use crate::tools::Workspace;
 use crate::tunnel::append_profile_log;
-use crate::tools::policy::PolicySettings;
 use crate::workspace::{AuthConfig, RuntimeConfig};
 
 pub type ShutdownSender = oneshot::Sender<()>;
@@ -35,6 +39,7 @@ struct ListenerState {
     bearer_token: Option<String>,
     oauth: Option<Arc<OAuthRuntime>>,
     oauth_client_secret: Option<String>,
+    gateway: Option<Arc<GatewayRouter>>,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -88,6 +93,7 @@ pub fn spawn_listener(
     } else {
         None
     };
+    let gateway = GatewayRouter::from_host(workspace_id.clone())?;
     let state = ListenerState {
         mcp,
         auth,
@@ -98,6 +104,7 @@ pub fn spawn_listener(
         bearer_token,
         oauth,
         oauth_client_secret,
+        gateway,
     };
     // 在返回 Running 之前完成 bind，避免后台任务里的端口冲突被伪装成启动成功。
     let listener = bind_listener(port)?;
@@ -201,24 +208,96 @@ async fn mcp_post(
         .and_then(Value::as_str)
         .unwrap_or("")
         .to_string();
+    let identifiers = request_session_identifiers(&headers, &body);
+    let resolved_session = if let Some(router) = state.gateway.as_ref() {
+        match router.resolve_session_identity(identifiers.clone(), method == "initialize") {
+            Ok(session) => Some(session),
+            Err(error) => {
+                let code = error["error"]["code"]
+                    .as_str()
+                    .unwrap_or("session_identity_conflict");
+                let message = error["error"]["message"]
+                    .as_str()
+                    .unwrap_or("MCP session identifiers conflict.");
+                let raw_hash = identifiers
+                    .openai
+                    .as_deref()
+                    .or(identifiers.transport.as_deref())
+                    .map(GatewayRouter::session_hash)
+                    .unwrap_or_default();
+                append_profile_log(
+                    &state.workspace_id,
+                    "mcp-requests.log",
+                    &format!(
+                        "[rpc] rejected method={} tool={} session_hash={} reason={}",
+                        method, tool_name, raw_hash, code
+                    ),
+                );
+                return Json(rpc_error(request_id, code, message)).into_response();
+            }
+        }
+    } else {
+        None
+    };
+    let session_key = resolved_session
+        .as_ref()
+        .map(|session| session.key.clone())
+        .or_else(|| identifiers.openai.clone())
+        .or_else(|| identifiers.transport.clone());
+    let transport_id = resolved_session
+        .as_ref()
+        .and_then(|session| session.transport_id.clone())
+        .or_else(|| identifiers.transport.clone());
+    let session_hash = session_key
+        .as_deref()
+        .map(GatewayRouter::session_hash)
+        .unwrap_or_default();
+    let selected_workspace = state
+        .gateway
+        .as_ref()
+        .and_then(|router| {
+            session_key
+                .as_deref()
+                .map(|key| router.selected_workspace_id(key))
+        })
+        .unwrap_or_else(|| state.workspace_id.clone());
     append_profile_log(
         &state.workspace_id,
         "mcp-requests.log",
         &format!(
-            "[rpc] request id={} method={} tool={}",
-            request_id, method, tool_name
+            "[rpc] request method={} tool={} session_hash={} target_workspace_id={}",
+            method, tool_name, session_hash, selected_workspace
         ),
     );
 
     let mcp = state.mcp.clone();
     let profile_id = state.workspace_id.clone();
-    let result = tokio::task::spawn_blocking(move || handle_request(&mcp, &body)).await;
+    let gateway = state.gateway.clone();
+    let request_session_key = session_key.clone();
+    let request_session_source = resolved_session.as_ref().map(|session| session.source);
+    let result = tokio::task::spawn_blocking(move || {
+        if let Some(router) = gateway.as_ref() {
+            handle_gateway_request_with_source(
+                router,
+                &mcp,
+                &body,
+                request_session_key.as_deref(),
+                request_session_source,
+            )
+        } else {
+            handle_request(&mcp, &body)
+        }
+    })
+    .await;
     match result {
         Ok(response) => {
             append_profile_log(
                 &profile_id,
                 "mcp-requests.log",
-                &format!("[rpc] completed id={} method={} tool={}", request_id, method, tool_name),
+                &format!(
+                    "[rpc] completed method={} tool={} session_hash={} target_workspace_id={}",
+                    method, tool_name, session_hash, selected_workspace
+                ),
             );
             if tool_name == "exec_command" || tool_name == "exec_health_check" {
                 let structured = response
@@ -245,20 +324,26 @@ async fn mcp_post(
                     &profile_id,
                     "mcp-requests.log",
                     &format!(
-                        "[exec] id={} tool={} is_error={} status={} termination_reason={} exit_code={}",
-                        request_id, tool_name, is_error, status, termination_reason, exit_code
+                        "[exec] tool={} is_error={} status={} termination_reason={} exit_code={} session_hash={} target_workspace_id={}",
+                        tool_name, is_error, status, termination_reason, exit_code, session_hash, selected_workspace
                     ),
                 );
             }
-            Json(response).into_response()
+            let mut http_response = Json(response).into_response();
+            if let Some(transport_id) = transport_id.as_deref() {
+                if let Ok(value) = HeaderValue::from_str(transport_id) {
+                    http_response.headers_mut().insert("Mcp-Session-Id", value);
+                }
+            }
+            http_response
         }
         Err(error) => {
             append_profile_log(
                 &profile_id,
                 "mcp-requests.log",
                 &format!(
-                    "[rpc] worker_failed id={} method={} tool={} error={error}",
-                    request_id, method, tool_name
+                    "[rpc] worker_failed method={} tool={} session_hash={} target_workspace_id={} error={error}",
+                    method, tool_name, session_hash, selected_workspace
                 ),
             );
             Json(json!({
@@ -278,6 +363,28 @@ async fn mcp_post(
             .into_response()
         }
     }
+}
+
+fn request_session_identifiers(headers: &HeaderMap, body: &Value) -> SessionIdentifiers {
+    let openai = body
+        .get("_meta")
+        .and_then(|meta| meta.get("openai/session"))
+        .or_else(|| {
+            body.get("params")
+                .and_then(|params| params.get("_meta"))
+                .and_then(|meta| meta.get("openai/session"))
+        })
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string);
+    let transport = headers
+        .get("Mcp-Session-Id")
+        .and_then(|value| value.to_str().ok())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string);
+    SessionIdentifiers { openai, transport }
 }
 
 fn require_mcp_auth(state: &ListenerState, headers: &HeaderMap) -> Option<Response> {
@@ -326,10 +433,16 @@ async fn oauth_authorize_get(
     let Some(oauth) = state.oauth.as_ref() else {
         return oauth_not_configured();
     };
-    authorize_get(
+    let workspace_names = state
+        .gateway
+        .as_ref()
+        .map(|router| router.authorization_workspace_names())
+        .unwrap_or_default();
+    authorize_get_with_workspace_names(
         oauth,
         params,
         Some(state.workspace_path.as_str()),
+        &workspace_names,
     )
 }
 
@@ -341,7 +454,17 @@ async fn oauth_authorize_post(
     let Some(oauth) = state.oauth.as_ref() else {
         return oauth_not_configured();
     };
-    authorize_post(oauth, form, &resolve_oauth_base(&state, &headers))
+    let workspace_names = state
+        .gateway
+        .as_ref()
+        .map(|router| router.authorization_workspace_names())
+        .unwrap_or_default();
+    authorize_post_with_workspace_names(
+        oauth,
+        form,
+        &resolve_oauth_base(&state, &headers),
+        &workspace_names,
+    )
 }
 
 async fn oauth_token_post(
@@ -374,10 +497,11 @@ fn oauth_not_configured() -> Response {
 
 #[cfg(test)]
 mod tests {
-    use axum::http::header::CACHE_CONTROL;
+    use axum::http::{header::CACHE_CONTROL, HeaderMap, HeaderValue};
+    use serde_json::json;
     use axum::response::IntoResponse;
 
-    use super::{bind_listener, mcp_discovery, mcp_discovery_payload};
+    use super::{bind_listener, mcp_discovery, mcp_discovery_payload, request_session_identifiers};
 
     #[test]
     fn bind_listener_reports_port_conflict_synchronously() {
@@ -399,5 +523,17 @@ mod tests {
         let response = mcp_discovery().await.into_response();
 
         assert_eq!(response.headers()[CACHE_CONTROL], "no-store");
+    }
+
+    #[test]
+    fn session_identity_reads_openai_metadata_before_transport_header() {
+        let mut headers = HeaderMap::new();
+        headers.insert("Mcp-Session-Id", HeaderValue::from_static("transport"));
+        let identifiers = request_session_identifiers(
+            &headers,
+            &json!({"params": {"_meta": {"openai/session": "conversation"}}}),
+        );
+        assert_eq!(identifiers.openai.as_deref(), Some("conversation"));
+        assert_eq!(identifiers.transport.as_deref(), Some("transport"));
     }
 }

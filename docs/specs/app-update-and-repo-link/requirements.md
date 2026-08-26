@@ -11,8 +11,8 @@
 
 ## 术语定义
 
-- **仓库主页**: 固定为 `https://github.com/mybolide/coding-tools-mcp`。
-- **Releases 最新页**: `https://github.com/mybolide/coding-tools-mcp/releases/latest`。
+- **仓库主页**: 固定为 `https://github.com/resign13/GPT-Tools-MCP`。
+- **Releases 最新页**: `https://github.com/resign13/GPT-Tools-MCP/releases/latest`。
 - **当前版本**: 与 `package.json`、`src-tauri/Cargo.toml`、`src-tauri/tauri.conf.json` 同步的应用版本字符串（前端由 `src/lib/app-version.ts` 读取）。
 - **最新发布版本**: GitHub Releases API `releases/latest` 返回的 `tag_name`（可带或不带 `v` 前缀）。
 

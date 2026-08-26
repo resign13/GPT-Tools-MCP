@@ -12,9 +12,10 @@
     sidebar: Snippet;
     onAddWorkspace?: () => void | Promise<void>;
     settingsNav?: Snippet;
+    gatewayMode?: boolean;
   }
 
-  let { children, sidebar, onAddWorkspace, settingsNav }: Props = $props();
+  let { children, sidebar, onAddWorkspace, settingsNav, gatewayMode = false }: Props = $props();
 
   async function openRepo() {
     try {
@@ -28,7 +29,21 @@
 <div class="app-layout">
   <aside class="tx-sidebar">
     <div class="tx-sidebar-header">
-      <div class="flex items-start justify-between gap-2">
+      {#if gatewayMode}
+        <div class="flex items-start justify-between gap-2">
+          <div>
+            <p class="tx-brand-kicker">Coding Tools</p>
+            <h1 class="tx-brand-title">MCP 网关</h1>
+          </div>
+          <ThemeToggle />
+        </div>
+        {#if onAddWorkspace}
+          <button type="button" class="tx-btn-primary tx-btn-sidebar" onclick={onAddWorkspace}>
+            新建工作区任务
+          </button>
+        {/if}
+      {/if}
+      <div class="flex items-start justify-between gap-2" class:hidden={gatewayMode}>
         <div>
           <p class="tx-brand-kicker">Coding Tools</p>
           <h1 class="tx-brand-title">桌面控制台</h1>
@@ -36,15 +51,18 @@
         <ThemeToggle />
       </div>
       {#if onAddWorkspace}
-        <button type="button" class="tx-btn-primary tx-btn-sidebar" onclick={onAddWorkspace}>
+        <button type="button" class="tx-btn-primary tx-btn-sidebar" class:hidden={gatewayMode} style:display={gatewayMode ? "none" : undefined} onclick={onAddWorkspace}>
           添加工作区
         </button>
       {/if}
     </div>
 
-    <div class="tx-sidebar-body">
+    <div class="tx-sidebar-body" class:gatewayMode={gatewayMode}>
       {#if onAddWorkspace}
         <p class="tx-sidebar-section-label">工作区</p>
+      {/if}
+      {#if gatewayMode}
+        <p class="tx-sidebar-section-label gateway-task-label">工作区任务</p>
       {/if}
       {@render sidebar()}
     </div>
@@ -82,3 +100,9 @@
 <svelte:head>
   <title>Coding Tools MCP</title>
 </svelte:head>
+
+<style>
+  .tx-sidebar-body.gatewayMode > .tx-sidebar-section-label:not(.gateway-task-label) {
+    display: none;
+  }
+</style>

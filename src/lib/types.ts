@@ -59,6 +59,13 @@ export interface WorkspaceProfile {
   auth: AuthConfig;
   runtime: RuntimeConfig;
   actions?: ActionsConfig;
+  gateway?: GatewayConfig;
+}
+
+export interface GatewayConfig {
+  enabled: boolean;
+  workspace_ids: string[];
+  prompt?: string;
 }
 
 export interface RuntimeStatus {

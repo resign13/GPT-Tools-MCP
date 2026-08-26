@@ -223,6 +223,31 @@ pub(crate) fn apply_proxy_env(cmd: &mut Command, proxy: &ProxyConfig) {
     }
 }
 
+fn normalize_cloudflare_token(value: &str) -> AppResult<&str> {
+    const INSTALL_MARKER: &str = "service install";
+
+    let trimmed = value.trim();
+    let lower = trimmed.to_ascii_lowercase();
+    let token = lower
+        .rfind(INSTALL_MARKER)
+        .filter(|index| *index == 0 || lower[..*index].contains("cloudflared"))
+        .map(|index| trimmed[index + INSTALL_MARKER.len()..].trim())
+        .unwrap_or(trimmed);
+
+    if token.is_empty() {
+        return Err(AppError::Message(
+            "Cloudflare named tunnel requires a Tunnel Token.".into(),
+        ));
+    }
+    if token.chars().any(char::is_whitespace) {
+        return Err(AppError::Message(
+            "Invalid Cloudflare Tunnel Token. Paste only the token, or the complete `cloudflared service install TOKEN` command."
+                .into(),
+        ));
+    }
+    Ok(token)
+}
+
 /// Spawn `cloudflared tunnel --url http://127.0.0.1:{port}` (quick) or named `tunnel run --token`.
 pub async fn spawn_cloudflare_tunnel(
     port: u16,
@@ -235,6 +260,11 @@ pub async fn spawn_cloudflare_tunnel(
 ) -> AppResult<CloudflareTunnelHandle> {
     let cloudflared = resolve_cloudflared()?;
     let quick = cloudflare_mode != "named";
+    let normalized_token = if quick {
+        ""
+    } else {
+        normalize_cloudflare_token(cloudflare_token)?
+    };
 
     if !quick {
         if cloudflare_token.trim().is_empty() {
@@ -282,7 +312,7 @@ pub async fn spawn_cloudflare_tunnel(
             "tunnel",
             "run",
             "--token",
-            cloudflare_token.trim(),
+            normalized_token,
         ]);
     }
 
@@ -307,12 +337,8 @@ pub async fn spawn_cloudflare_tunnel(
         });
     } else {
         let _ = ready_tx.send(QuickTunnelReady {
-            public_url: if quick {
-                None
-            } else {
-                Some(named_public_url.trim_end_matches('/').to_string())
-            },
-            named_ready: !quick,
+            public_url: None,
+            named_ready: false,
         });
     }
 
@@ -328,6 +354,14 @@ pub async fn spawn_cloudflare_tunnel(
             ))
         })?
         .map_err(|_| AppError::Message("cloudflared 输出流意外结束。".into()))?;
+
+    if !quick && !ready.named_ready {
+        let _ = stop_child(child, pid).await;
+        return Err(AppError::Message(format!(
+            "cloudflared exited before the named tunnel connected. Check the saved Tunnel Token and log: {}",
+            log_path_for_error.display()
+        )));
+    }
 
     let public_url = if quick {
         ready.public_url.ok_or_else(|| {
@@ -377,8 +411,8 @@ async fn stream_cloudflare_output<R, E>(
         Err(_) => {
             if let Some(tx) = ready_tx.take() {
                 let _ = tx.send(QuickTunnelReady {
-                    public_url: if quick { None } else { Some(named_url) },
-                    named_ready: !quick,
+                    public_url: None,
+                    named_ready: false,
                 });
             }
             return;
@@ -396,25 +430,24 @@ async fn stream_cloudflare_output<R, E>(
         }
     };
 
-    let handle_line = |line: &str,
-                           public_url: &mut Option<String>,
-                           ready_tx: &mut Option<oneshot::Sender<QuickTunnelReady>>| {
-        if quick {
-            if public_url.is_none() {
-                if let Some(url) = extract_trycloudflare_url(line) {
-                    *public_url = Some(url.clone());
-                    send_ready(ready_tx, Some(url), false);
+    let handle_line =
+        |line: &str,
+         public_url: &mut Option<String>,
+         ready_tx: &mut Option<oneshot::Sender<QuickTunnelReady>>| {
+            if quick {
+                if public_url.is_none() {
+                    if let Some(url) = extract_trycloudflare_url(line) {
+                        *public_url = Some(url.clone());
+                        send_ready(ready_tx, Some(url), false);
+                    }
+                }
+            } else {
+                let lowered = line.to_ascii_lowercase();
+                if lowered.contains("registered tunnel connection") {
+                    send_ready(ready_tx, Some(named_url.clone()), true);
                 }
             }
-        } else {
-            let lowered = line.to_ascii_lowercase();
-            if lowered.contains("registered tunnel connection")
-                || lowered.contains("starting metrics server")
-            {
-                send_ready(ready_tx, Some(named_url.clone()), true);
-            }
-        }
-    };
+        };
 
     // cloudflared logs primarily to stderr; read stdout and stderr concurrently.
     let (line_tx, mut line_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
@@ -447,7 +480,7 @@ async fn stream_cloudflare_output<R, E>(
         handle_line(&line, &mut public_url, &mut ready_tx);
     }
 
-    send_ready(&mut ready_tx, public_url, !quick);
+    send_ready(&mut ready_tx, public_url, false);
 }
 
 pub async fn stop_child(mut child: Child, pid: Option<u32>) -> AppResult<()> {
@@ -462,7 +495,8 @@ pub async fn stop_child(mut child: Child, pid: Option<u32>) -> AppResult<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::extract_trycloudflare_url;
+    use super::{extract_trycloudflare_url, normalize_cloudflare_token, stream_cloudflare_output};
+    use tokio::io::AsyncWriteExt;
 
     #[test]
     fn extracts_trycloudflare_url_from_log_line() {
@@ -477,5 +511,50 @@ mod tests {
     fn ignores_invalid_hosts() {
         let line = "https://bad_host.trycloudflare.com";
         assert!(extract_trycloudflare_url(line).is_none());
+    }
+
+    #[test]
+    fn extracts_token_from_cloudflared_install_command() {
+        assert_eq!(
+            normalize_cloudflare_token("cloudflared.exe service install TOKEN").unwrap(),
+            "TOKEN"
+        );
+        assert_eq!(normalize_cloudflare_token("TOKEN").unwrap(), "TOKEN");
+    }
+
+    #[test]
+    fn rejects_token_with_unrecognized_whitespace() {
+        assert!(normalize_cloudflare_token("not a tunnel token").is_err());
+    }
+
+    #[tokio::test]
+    async fn named_stream_end_before_registration_is_not_ready() {
+        let temp = tempfile::tempdir().unwrap();
+        let log_path = temp.path().join("cloudflared.log");
+        let (mut writer, reader) = tokio::io::duplex(256);
+        let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
+
+        let output_task = tokio::spawn(async move {
+            stream_cloudflare_output(
+                reader,
+                Some(tokio::io::empty()),
+                &log_path,
+                false,
+                "https://mcp.example.com".into(),
+                ready_tx,
+            )
+            .await;
+        });
+
+        writer
+            .write_all(b"Provided Tunnel token is not valid.\n")
+            .await
+            .unwrap();
+        writer.shutdown().await.unwrap();
+        drop(writer);
+
+        let ready = ready_rx.await.unwrap();
+        output_task.await.unwrap();
+        assert!(!ready.named_ready);
     }
 }

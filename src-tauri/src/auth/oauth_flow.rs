@@ -146,6 +146,15 @@ pub fn authorize_get(
     params: AuthorizeParams,
     workspace_path: Option<&str>,
 ) -> Response {
+    authorize_get_with_workspace_names(oauth, params, workspace_path, &[])
+}
+
+pub fn authorize_get_with_workspace_names(
+    oauth: &OAuthRuntime,
+    params: AuthorizeParams,
+    workspace_path: Option<&str>,
+    workspace_names: &[String],
+) -> Response {
     if params.response_type != "code" {
         return html_error("response_type must be 'code'", StatusCode::BAD_REQUEST);
     }
@@ -166,11 +175,21 @@ pub fn authorize_get(
         &params.state,
         "",
         workspace_path,
+        workspace_names,
     ))
     .into_response()
 }
 
 pub fn authorize_post(oauth: &OAuthRuntime, form: AuthorizeForm, server_url: &str) -> Response {
+    authorize_post_with_workspace_names(oauth, form, server_url, &[])
+}
+
+pub fn authorize_post_with_workspace_names(
+    oauth: &OAuthRuntime,
+    form: AuthorizeForm,
+    server_url: &str,
+    workspace_names: &[String],
+) -> Response {
     if !oauth.client_id_allowed(&form.client_id) {
         return Html(login_page(
             &form.client_id,
@@ -180,6 +199,7 @@ pub fn authorize_post(oauth: &OAuthRuntime, form: AuthorizeForm, server_url: &st
             &form.state,
             "Invalid client",
             None,
+            workspace_names,
         ))
         .into_response();
     }
@@ -192,6 +212,7 @@ pub fn authorize_post(oauth: &OAuthRuntime, form: AuthorizeForm, server_url: &st
             &form.state,
             "Invalid PKCE parameters",
             None,
+            workspace_names,
         ))
         .into_response();
     }
@@ -206,6 +227,7 @@ pub fn authorize_post(oauth: &OAuthRuntime, form: AuthorizeForm, server_url: &st
                 &form.state,
                 "Invalid password",
                 None,
+                workspace_names,
             )),
         )
             .into_response();
@@ -369,6 +391,7 @@ fn html_error(message: &str, status: StatusCode) -> Response {
     (status, Html(format!("<h2>Error</h2><p>{message}</p>"))).into_response()
 }
 
+#[allow(clippy::too_many_arguments)]
 fn login_page(
     client_id: &str,
     redirect_uri: &str,
@@ -377,6 +400,7 @@ fn login_page(
     state: &str,
     error: &str,
     workspace_path: Option<&str>,
+    workspace_names: &[String],
 ) -> String {
     let error_block = if error.is_empty() {
         String::new()
@@ -387,6 +411,15 @@ fn login_page(
         .filter(|path| !path.is_empty())
         .map(|path| format!("<p>Workspace: <code>{}</code></p>", html_escape(path)))
         .unwrap_or_default();
+    let gateway_block = if workspace_names.is_empty() {
+        String::new()
+    } else {
+        let names = workspace_names
+            .iter()
+            .map(|name| format!("<li>{}</li>", html_escape(name)))
+            .collect::<String>();
+        format!("<p>Gateway workspaces:</p><ul>{names}</ul>")
+    };
     format!(
         "<!DOCTYPE html><html lang='en'><head><meta charset='utf-8'>\
         <title>Authorize MCP Server</title>\
@@ -396,6 +429,7 @@ fn login_page(
         </head><body>\
         <h2>Authorize Coding Tools MCP</h2>\
         {workspace_block}\
+        {gateway_block}\
         <p>Client: <strong>{}</strong></p>\
         <p>Redirect URI: <code>{}</code></p>\
         {error_block}\
@@ -496,6 +530,24 @@ mod tests {
             "https://lb.example.com",
         );
         assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[test]
+    fn gateway_workspace_names_are_rendered_without_credentials() {
+        let html = login_page(
+            "client",
+            "https://chatgpt.com/callback",
+            "challenge",
+            "S256",
+            "state",
+            "",
+            None,
+            &["Alpha project".into(), "Beta project".into()],
+        );
+        assert!(html.contains("Gateway workspaces:"));
+        assert!(html.contains("Alpha project"));
+        assert!(html.contains("Beta project"));
+        assert!(!html.contains("oauth_token_secret"));
     }
 
     #[test]

@@ -51,7 +51,7 @@ fn initialize_result() -> Value {
             "title": "Coding Tools MCP",
             "version": env!("CARGO_PKG_VERSION")
         },
-        "instructions": "Use these tools only for local coding operations inside the configured workspace. At the start of every new ChatGPT conversation, before answering the user's first request, call history_session_bootstrap exactly once and pass the user's verbatim first request as initial_user_input. Treat bootstrap as required conversation initialization: it creates or resumes a lossless Markdown archive and returns bounded current state, not all history. Use history_session_search followed by history_session_read only when exact earlier context is needed. history_session_read returns a bounded UTF-8-safe page; follow next_cursor with the returned content hash until the relevant archive is complete. Repeated successful bootstrap calls in the same conversation resume the same session and must not create duplicates. Preserve session_key and current_path returned by bootstrap, then pass them unchanged as session_key and expected_path to every history_session_checkpoint call. After completing each user-requested task in the conversation, call history_session_checkpoint before the final response and pass that user's verbatim request as raw_user_input. Only state that progress was saved after checkpoint returns ok=true with the same session_key and path. The server cannot access ChatGPT transcript text that was not provided as a tool argument; persistence is not automatic background persistence."
+        "instructions": "Use these tools only for local coding operations inside the configured workspace. At the start of every new ChatGPT conversation, if the tool catalog includes bind_workspace, inspect the user's first request for an exact workspace ID, name, full path, or final directory name and call bind_workspace before any project tool. If no workspace is explicit, call list_workspaces and ask the user to choose; do not assume the gateway host. A successful binding is locked to this ChatGPT conversation, so create a new conversation to use another workspace. After binding (or immediately in single-workspace mode), before answering the user's first request, call history_session_bootstrap exactly once and pass the user's verbatim first request as initial_user_input. Treat bootstrap as required conversation initialization: it creates or resumes a lossless Markdown archive and returns bounded current state, not all history. Use history_session_search followed by history_session_read only when exact earlier context is needed. history_session_read returns a bounded UTF-8-safe page; follow next_cursor with the returned content hash until the relevant archive is complete. Repeated successful bootstrap calls in the same conversation resume the same session and must not create duplicates. Preserve session_key and current_path returned by bootstrap, then pass them unchanged as session_key and expected_path to every history_session_checkpoint call. After completing each user-requested task in the conversation, call history_session_checkpoint before the final response and pass that user's verbatim request as raw_user_input. Only state that progress was saved after checkpoint returns ok=true with the same session_key and path. The server cannot access ChatGPT transcript text that was not provided as a tool argument; persistence is not automatic background persistence."
     })
 }
 
@@ -130,6 +130,9 @@ mod tests {
         let initialized = initialize_result();
         let instructions = initialized["instructions"].as_str().expect("instructions");
         assert!(instructions.contains("history_session_bootstrap"));
+        assert!(instructions.contains("bind_workspace"));
+        assert!(instructions.contains("do not assume the gateway host"));
+        assert!(instructions.contains("locked to this ChatGPT conversation"));
         assert!(instructions.contains("At the start of every new ChatGPT conversation"));
         assert!(instructions.contains("before answering the user's first request"));
         assert!(instructions.contains("required conversation initialization"));
@@ -163,6 +166,9 @@ mod tests {
         assert!(component.contains("请初始化或恢复当前项目会话"));
         assert!(component.contains("如果没有历史记录"));
         assert!(component.contains("initial_user_input"));
+        assert!(component.contains("bind_workspace"));
+        assert!(component.contains("list_workspaces"));
+        assert!(component.contains("create a new conversation to switch projects"));
         assert!(component.contains("raw_user_input"));
         assert!(component.contains("history_session_search"));
         assert!(component.contains("history_session_checkpoint"));

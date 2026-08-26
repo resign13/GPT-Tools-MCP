@@ -1,4 +1,4 @@
 /** Canonical public links for Coding Tools MCP. */
-export const REPO_URL = "https://github.com/mybolide/coding-tools-mcp";
+export const REPO_URL = "https://github.com/resign13/GPT-Tools-MCP";
 export const RELEASES_LATEST_URL =
-  "https://github.com/mybolide/coding-tools-mcp/releases/latest";
+  "https://github.com/resign13/GPT-Tools-MCP/releases/latest";

@@ -9,6 +9,11 @@
 本会话每轮任务完成后调用 history_session_checkpoint，并原样传入 bootstrap 返回的 session_key 和 current_path，以及我本轮请求的逐字 raw_user_input。
 只有 checkpoint 返回 ok=true 且会话目标一致后才能确认进度已保存；服务端不能自动读取未通过工具参数传入的对话内容。`;
 
+  const sessionPromptForCopy = `For a new ChatGPT conversation, start the first request with an exact workspace name, ID, full path, or final directory name.
+When the gateway exposes bind_workspace, call it with that hint before any project tool. If the first request has no explicit workspace, call list_workspaces and ask the user to choose; never assume the host workspace. A successful binding is locked to this conversation, so create a new conversation to switch projects.
+After binding, call history_session_bootstrap exactly once with the verbatim first request as initial_user_input. Use history_session_search and history_session_read only when earlier context is needed, following next_cursor and content hashes.
+After each task, call history_session_checkpoint with the session_key and current_path returned by bootstrap, plus the verbatim raw_user_input. Only report saved progress after checkpoint returns ok=true.`;
+  void sessionPrompt;
   let copying = $state(false);
   let copied = $state(false);
   let expanded = $state(false);
@@ -22,7 +27,7 @@
     errorMessage = "";
     if (resetTimer) clearTimeout(resetTimer);
     try {
-      await navigator.clipboard.writeText(sessionPrompt);
+      await navigator.clipboard.writeText(sessionPromptForCopy);
       copied = true;
       showToast("新会话启动提示词已复制，可以直接粘贴到 ChatGPT。", {
         title: "复制成功",
@@ -109,7 +114,7 @@
     <div id="chatgpt-session-prompt-content" class="mt-3 border-t border-[var(--color-border)] pt-3">
       <pre
         class="tx-mono whitespace-pre-wrap break-words rounded-[10px] bg-[var(--surface-hover)] p-3 leading-5 text-[var(--color-text-secondary)]"
-      >{sessionPrompt}</pre>
+      >{sessionPromptForCopy}</pre>
       <p class="mt-2 text-[11px] leading-5 text-[var(--color-text-muted)]">
         复制后粘贴到使用当前工作区 MCP 连接器的 ChatGPT 新会话。
       </p>

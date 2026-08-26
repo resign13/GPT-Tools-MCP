@@ -12,6 +12,18 @@ pub struct WorkspaceProfile {
     pub runtime: RuntimeConfig,
     #[serde(default)]
     pub actions: ActionsConfig,
+    #[serde(default)]
+    pub gateway: GatewayConfig,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub struct GatewayConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default)]
+    pub workspace_ids: Vec<String>,
+    #[serde(default)]
+    pub prompt: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -266,6 +278,7 @@ impl WorkspaceProfile {
             auth: AuthConfig::default(),
             runtime: RuntimeConfig::default(),
             actions: ActionsConfig::default(),
+            gateway: GatewayConfig::default(),
         }
     }
 
@@ -376,4 +389,26 @@ fn computed_public_url(
         }
     }
     public_url.trim_end_matches('/').to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::WorkspaceProfile;
+
+    #[test]
+    fn missing_gateway_config_migrates_to_disabled_defaults() {
+        let value = serde_json::json!({
+            "id": "legacy",
+            "name": "Legacy",
+            "path": ".",
+            "tunnel": {},
+            "auth": {},
+            "runtime": {},
+            "actions": {}
+        });
+        let profile: WorkspaceProfile = serde_json::from_value(value).expect("legacy profile");
+        assert!(!profile.gateway.enabled);
+        assert!(profile.gateway.workspace_ids.is_empty());
+        assert!(profile.gateway.prompt.is_empty());
+    }
 }

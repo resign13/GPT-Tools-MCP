@@ -2,4 +2,7 @@ pub mod legacy_import;
 mod model;
 pub mod resources;
 
-pub use model::{ActionsConfig, AuthConfig, RuntimeConfig, RuntimeStatusDto, WorkspaceProfile};
+#[allow(unused_imports)]
+pub use model::{
+    ActionsConfig, AuthConfig, GatewayConfig, RuntimeConfig, RuntimeStatusDto, WorkspaceProfile,
+};

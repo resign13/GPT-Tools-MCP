@@ -63,12 +63,12 @@ pub fn get_webview_memory_sample() -> AppResult<WebviewMemorySample> {
     #[cfg(windows)]
     {
         let sample = crate::platform::windows::process::sample_process_tree_memory()?;
-        return Ok(WebviewMemorySample {
+        Ok(WebviewMemorySample {
             main_mb: (bytes_to_mb(sample.main_bytes) * 10.0).round() / 10.0,
             webview_mb: (bytes_to_mb(sample.webview_bytes) * 10.0).round() / 10.0,
             webview_process_count: sample.webview_process_count,
             supported: true,
-        });
+        })
     }
     #[cfg(not(windows))]
     {
@@ -125,8 +125,8 @@ pub async fn recreate_ui_webview(app: AppHandle) -> AppResult<()> {
     let outer_position = window
         .outer_position()
         .ok()
-        .filter(|pos| is_sane_position(pos));
-    let outer_size = window.outer_size().ok().filter(|size| is_sane_size(size));
+        .filter(is_sane_position);
+    let outer_size = window.outer_size().ok().filter(is_sane_size);
 
     // Keepalive window: ensures destroy(main) is not "close last window → exit".
     let keepalive = WebviewWindowBuilder::new(
@@ -162,16 +162,20 @@ pub async fn recreate_ui_webview(app: AppHandle) -> AppResult<()> {
 
     let new_window = match new_window {
         Ok(w) => w,
-        Err(config_err) => WebviewWindowBuilder::new(&app, &label, WebviewUrl::App("index.html".into()))
-            .title("Coding Tools MCP")
-            .inner_size(1280.0, 800.0)
-            .min_inner_size(960.0, 640.0)
-            .build()
-            .map_err(|err| {
-                AppError::Message(format!(
-                    "rebuild webview failed ({config_err}); fallback also failed: {err}"
-                ))
-            })?,
+        Err(config_err) => WebviewWindowBuilder::new(
+            &app,
+            &label,
+            WebviewUrl::App("index.html".into()),
+        )
+        .title("Coding Tools MCP")
+        .inner_size(1280.0, 800.0)
+        .min_inner_size(960.0, 640.0)
+        .build()
+        .map_err(|err| {
+            AppError::Message(format!(
+                "rebuild webview failed ({config_err}); fallback also failed: {err}"
+            ))
+        })?,
     };
 
     if let Some(size) = outer_size {
