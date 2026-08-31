@@ -110,11 +110,9 @@ impl DataStore {
     }
 
     pub fn remove(&mut self, id: &str) -> AppResult<Option<WorkspaceProfile>> {
-        let Some(index) = self.data.profiles.iter().position(|item| item.id == id) else {
+        let Some(removed) = remove_workspace_data(&mut self.data, id) else {
             return Ok(None);
         };
-        let removed = self.data.profiles.remove(index);
-        self.data.workspace_secrets.remove(id);
         self.save()?;
         Ok(Some(removed))
     }
@@ -247,6 +245,19 @@ fn shared_value_for_key(key: &str) -> String {
     }
 }
 
+fn remove_workspace_data(data: &mut AppData, id: &str) -> Option<WorkspaceProfile> {
+    let index = data.profiles.iter().position(|item| item.id == id)?;
+    let removed = data.profiles.remove(index);
+    data.workspace_secrets.remove(id);
+    for profile in &mut data.profiles {
+        profile
+            .gateway
+            .workspace_ids
+            .retain(|workspace_id| workspace_id != id);
+    }
+    Some(removed)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -270,5 +281,49 @@ mod tests {
         let value = shared_value_for_key("oauth_client_id");
         assert!(value.starts_with("chatgpt-client-"));
         assert_eq!(value.len(), "chatgpt-client-".len() + 12);
+    }
+
+    #[test]
+    fn removing_workspace_prunes_gateway_allowlists_and_secrets() {
+        let mut host = WorkspaceProfile::new("C:/workspace/host".into(), Some("host".into()));
+        host.id = "host".into();
+        host.gateway.enabled = true;
+        host.gateway.workspace_ids = vec!["host".into(), "target".into()];
+
+        let mut target =
+            WorkspaceProfile::new("C:/workspace/target".into(), Some("target".into()));
+        target.id = "target".into();
+
+        let mut data = AppData::default();
+        data.profiles = vec![host, target];
+        data.workspace_secrets
+            .entry("target".into())
+            .or_default()
+            .insert("bearer_token".into(), "secret".into());
+
+        let removed = remove_workspace_data(&mut data, "target").expect("target removed");
+
+        assert_eq!(removed.id, "target");
+        assert_eq!(data.profiles.len(), 1);
+        assert_eq!(data.profiles[0].id, "host");
+        assert_eq!(data.profiles[0].gateway.workspace_ids, vec!["host"]);
+        assert!(!data.workspace_secrets.contains_key("target"));
+    }
+
+    #[test]
+    fn removing_missing_workspace_keeps_gateway_allowlist() {
+        let mut host = WorkspaceProfile::new("C:/workspace/host".into(), Some("host".into()));
+        host.id = "host".into();
+        host.gateway.enabled = true;
+        host.gateway.workspace_ids = vec!["host".into(), "target".into()];
+
+        let mut data = AppData::default();
+        data.profiles = vec![host];
+
+        assert!(remove_workspace_data(&mut data, "missing").is_none());
+        assert_eq!(
+            data.profiles[0].gateway.workspace_ids,
+            vec!["host", "target"]
+        );
     }
 }

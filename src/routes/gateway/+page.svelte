@@ -1,10 +1,11 @@
 <script lang="ts">
   import { goto } from "$app/navigation";
   import { page } from "$app/stores";
-  import { ArrowRight, FolderKanban, Play, Square, Settings2, Radio, Plus } from "@lucide/svelte";
+  import { confirm } from "@tauri-apps/plugin-dialog";
+  import { ArrowRight, FolderKanban, Play, Square, Settings2, Radio, Plus, Trash2 } from "@lucide/svelte";
   import CopyButton from "$lib/components/CopyButton.svelte";
   import StatusOrb from "$lib/components/StatusOrb.svelte";
-  import { getRuntimeStatus, listWorkspaces, startRuntime, stopRuntime } from "$lib/api/workspaces";
+  import { deleteWorkspace, getRuntimeStatus, listWorkspaces, startRuntime, stopRuntime } from "$lib/api/workspaces";
   import { workspaces } from "$lib/stores/app";
   import { showToast } from "$lib/stores/toast";
   import { mcpLocalEndpoint, type RuntimeState, type RuntimeStatus, type WorkspaceProfile } from "$lib/types";
@@ -12,6 +13,7 @@
   let profiles = $state<WorkspaceProfile[]>([]);
   let runtime = $state<RuntimeStatus | null>(null);
   let busy = $state(false);
+  let deletingId = $state("");
 
   const selectedId = $derived($page.url.searchParams.get("workspace") ?? profiles[0]?.id ?? "");
   const selected = $derived(profiles.find((profile) => profile.id === selectedId) ?? profiles[0] ?? null);
@@ -57,6 +59,36 @@
 
   function openGatewayConfig() {
     if (host) goto(`/workspace/${encodeURIComponent(host.id)}`);
+  }
+
+  async function deleteTask(task: WorkspaceProfile) {
+    if (task.id === host?.id || deletingId) return;
+    const wasSelected = selectedId === task.id;
+    deletingId = task.id;
+    try {
+      const accepted = await confirm(
+        `确定删除工作区任务“${task.name}”吗？\n\n只会移除 Coding Tools MCP 中保存的任务配置，不会删除本地目录：\n${task.path}`,
+        { title: "删除工作区任务", kind: "warning" },
+      );
+      if (!accepted) return;
+
+      await deleteWorkspace(task.id);
+      await load();
+
+      if (wasSelected) {
+        const fallback = profiles.find((profile) => profile.gateway?.enabled) ?? profiles[0] ?? null;
+        await goto(fallback ? `/gateway?workspace=${encodeURIComponent(fallback.id)}` : "/gateway");
+      }
+      showToast(`已删除工作区任务“${task.name}”。本地目录未删除。`, {
+        title: "删除成功",
+        kind: "success",
+        duration: 4000,
+      });
+    } catch (error) {
+      showToast(String(error), { title: "删除工作区任务失败", kind: "error", duration: 8000 });
+    } finally {
+      deletingId = "";
+    }
   }
 
   $effect(() => {
@@ -162,19 +194,39 @@
       {:else}
         <div class="grid gap-2">
           {#each profiles as task (task.id)}
-            <button
-              type="button"
-              class="tx-card flex items-center gap-3 p-4 text-left transition-colors hover:border-[var(--primary)] {task.id === selected?.id ? 'border-[var(--primary)] bg-[var(--primary-soft)]' : ''}"
-              onclick={() => selectTask(task.id)}
+            <div
+              class="group relative tx-card flex items-center p-2 transition-colors hover:border-[var(--primary)] {task.id === selected?.id ? 'border-[var(--primary)] bg-[var(--primary-soft)]' : ''}"
             >
-              <FolderKanban size={18} class="shrink-0 text-[var(--primary)]" aria-hidden="true" />
-              <span class="min-w-0 flex-1">
-                <span class="block truncate text-sm font-semibold">{task.name}</span>
-                <span class="mt-1 block truncate text-xs text-[var(--color-text-muted)]">{task.path}</span>
-              </span>
-              {#if task.id === host?.id}<span class="tx-badge">宿主</span>{/if}
-              <ArrowRight size={15} class="shrink-0 text-[var(--color-text-muted)]" aria-hidden="true" />
-            </button>
+              <button
+                type="button"
+                class="flex min-w-0 flex-1 items-center gap-3 rounded-[8px] p-2 text-left"
+                onclick={() => selectTask(task.id)}
+              >
+                <FolderKanban size={18} class="shrink-0 text-[var(--primary)]" aria-hidden="true" />
+                <span class="min-w-0 flex-1">
+                  <span class="block truncate text-sm font-semibold">{task.name}</span>
+                  <span class="mt-1 block truncate text-xs text-[var(--color-text-muted)]">{task.path}</span>
+                </span>
+                {#if task.id === host?.id}<span class="tx-badge">宿主</span>{/if}
+                <ArrowRight
+                  size={15}
+                  class="shrink-0 text-[var(--color-text-muted)] transition-opacity {task.id !== host?.id ? 'group-hover:opacity-0 group-focus-within:opacity-0' : ''}"
+                  aria-hidden="true"
+                />
+              </button>
+              {#if task.id !== host?.id}
+                <button
+                  type="button"
+                  class="pointer-events-none absolute right-3 top-1/2 inline-flex h-8 w-8 -translate-y-1/2 items-center justify-center rounded-lg text-[var(--color-text-muted)] opacity-0 transition-[opacity,background-color,color] group-hover:pointer-events-auto group-hover:opacity-100 group-focus-within:pointer-events-auto group-focus-within:opacity-100 hover:bg-[rgba(239,68,68,0.08)] hover:text-[var(--danger)] focus-visible:bg-[rgba(239,68,68,0.08)] focus-visible:text-[var(--danger)] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[var(--primary)] disabled:pointer-events-none"
+                  disabled={Boolean(deletingId)}
+                  title={`删除工作区任务 ${task.name}`}
+                  aria-label={`删除工作区任务 ${task.name}`}
+                  onclick={() => void deleteTask(task)}
+                >
+                  <Trash2 size={15} aria-hidden="true" />
+                </button>
+              {/if}
+            </div>
           {/each}
         </div>
       {/if}
