@@ -20,9 +20,11 @@ pub fn should_prevent_exit() -> bool {
 struct RecreateGuard;
 
 impl RecreateGuard {
-    fn enter() -> Self {
-        UI_RECREATING.store(true, Ordering::SeqCst);
-        Self
+    fn try_enter() -> Option<Self> {
+        UI_RECREATING
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .ok()
+            .map(|_| Self)
     }
 }
 
@@ -91,7 +93,9 @@ pub fn get_webview_memory_sample() -> AppResult<WebviewMemorySample> {
 /// keepalive window first so "last window closed" never fires for the main UI.
 #[command]
 pub async fn recreate_ui_webview(app: AppHandle) -> AppResult<()> {
-    let _guard = RecreateGuard::enter();
+    let _guard = RecreateGuard::try_enter().ok_or_else(|| {
+        AppError::Message("UI webview recreation is already in progress".into())
+    })?;
 
     // Drop any leftover keepalive from a previous failed attempt.
     if let Some(stale) = app.get_webview_window(KEEPALIVE_LABEL) {
@@ -162,20 +166,32 @@ pub async fn recreate_ui_webview(app: AppHandle) -> AppResult<()> {
 
     let new_window = match new_window {
         Ok(w) => w,
-        Err(config_err) => WebviewWindowBuilder::new(
-            &app,
-            &label,
-            WebviewUrl::App("index.html".into()),
-        )
-        .title("Coding Tools MCP")
-        .inner_size(1280.0, 800.0)
-        .min_inner_size(960.0, 640.0)
-        .build()
-        .map_err(|err| {
-            AppError::Message(format!(
-                "rebuild webview failed ({config_err}); fallback also failed: {err}"
-            ))
-        })?,
+        Err(config_err) => {
+            // A destroyed WebView can remain registered briefly on Windows, so
+            // rebuilding with the original `main` label may fail. Use a fresh
+            // UI label as a recovery path instead of returning with no window.
+            let recovery_label = format!(
+                "{label}-recovered-{}",
+                uuid::Uuid::new_v4().simple()
+            );
+            eprintln!(
+                "[ui-memory] configured webview rebuild failed ({config_err}); trying {recovery_label}"
+            );
+            WebviewWindowBuilder::new(
+                &app,
+                &recovery_label,
+                WebviewUrl::App("index.html".into()),
+            )
+            .title("Coding Tools MCP")
+            .inner_size(1280.0, 800.0)
+            .min_inner_size(960.0, 640.0)
+            .build()
+            .map_err(|err| {
+                AppError::Message(format!(
+                    "rebuild webview failed ({config_err}); recovery also failed: {err}"
+                ))
+            })?
+        }
     };
 
     if let Some(size) = outer_size {

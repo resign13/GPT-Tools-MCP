@@ -20,7 +20,9 @@ export default defineConfig(async () => ({
         }
       : undefined,
     watch: {
-      ignored: ["**/src-tauri/**"],
+      // Codex-created worktrees contain their own .svelte-kit/tsconfig.json.
+      // Watching them makes the active desktop UI perform repeated full reloads.
+      ignored: ["**/src-tauri/**", "**/output/worktrees/**"],
     },
   },
 }));

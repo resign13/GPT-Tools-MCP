@@ -5,7 +5,8 @@
   "type": "module",
   "scripts": {
     "dev": "vite dev",
-    "desktop": "tauri dev",
+    "desktop": "node desktop-dev.mjs",
+    "desktop:watch": "tauri dev",
     "desktop:build": "tauri build",
     "start": "tauri dev",
     "build": "vite build",

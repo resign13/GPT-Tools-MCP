@@ -35,6 +35,29 @@ use tauri::menu::{Menu, MenuItem};
 use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
 use tauri::{Emitter, Manager, WindowEvent};
 
+fn lifecycle_log(message: &str) {
+    let Ok(dir) = platform::platform().app_config_dir() else {
+        return;
+    };
+    if std::fs::create_dir_all(&dir).is_err() {
+        return;
+    }
+    let path = dir.join("lifecycle.log");
+    let Ok(mut file) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+    else {
+        return;
+    };
+    use std::io::Write;
+    let timestamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_secs())
+        .unwrap_or_default();
+    let _ = writeln!(file, "{timestamp} pid={} {message}", std::process::id());
+}
+
 #[cfg(target_os = "windows")]
 fn signal_existing_instance() -> bool {
     use windows::core::w;
@@ -151,9 +174,16 @@ fn setup_tray(app: &tauri::App) -> tauri::Result<()> {
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    lifecycle_log("startup");
     if !acquire_single_instance() {
+        lifecycle_log("second-instance-forwarded");
         return;
     }
+    let previous_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        lifecycle_log(&format!("panic: {info}"));
+        previous_hook(info);
+    }));
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
         .setup(|app| {
@@ -223,19 +253,33 @@ pub fn run() {
                 // While recreating the UI WebView we temporarily destroy the main
                 // window; without prevent_exit Tauri would quit the whole process
                 // and take MCP/FRP down with it (0.1.30 regression).
-                if commands::ui_memory::should_prevent_exit() {
+                let prevent = commands::ui_memory::should_prevent_exit();
+                lifecycle_log(&format!("exit-requested prevent={prevent}"));
+                if prevent {
                     api.prevent_exit();
                 }
             }
             tauri::RunEvent::WindowEvent { label, event, .. } => {
-                if label != "main" {
+                // UI recovery can use a temporary non-internal label when the
+                // original `main` label is still registered by WebView2.
+                if label.starts_with("__") {
                     return;
                 }
-                if let WindowEvent::CloseRequested { api, .. } = event {
-                    if commands::window_chrome::should_intercept_close() {
-                        api.prevent_close();
-                        let _ = app_handle.emit("close-requested", ());
+                match event {
+                    WindowEvent::CloseRequested { api, .. } => {
+                        let intercept = commands::window_chrome::should_intercept_close();
+                        lifecycle_log(&format!(
+                            "close-requested label={label} intercept={intercept}"
+                        ));
+                        if intercept {
+                            api.prevent_close();
+                            let _ = app_handle.emit("close-requested", ());
+                        }
                     }
+                    WindowEvent::Destroyed => {
+                        lifecycle_log(&format!("window-destroyed label={label}"));
+                    }
+                    _ => {}
                 }
             }
             _ => {}
