@@ -6,14 +6,19 @@ use std::time::{Duration, Instant};
 
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
-use tokio::sync::{OwnedRwLockReadGuard, OwnedRwLockWriteGuard, OwnedSemaphorePermit, RwLock, Semaphore};
+use tokio::sync::{
+    OwnedRwLockReadGuard, OwnedRwLockWriteGuard, OwnedSemaphorePermit, RwLock, Semaphore,
+};
 
 use crate::data::DataStore;
 use crate::mcp::server::{handle_request, SharedState};
+use crate::mcp::workspace_context::WorkspaceContextPin;
 use crate::tools::policy::PolicySettings;
 use crate::tools::workspace::{tool_err_code, tool_ok, Workspace};
 use crate::tools::ToolContext;
 use crate::workspace::WorkspaceProfile;
+
+mod workspace_context_gateway;
 
 const MAX_BINDINGS: usize = 256;
 const BINDING_TTL: Duration = Duration::from_secs(24 * 60 * 60);
@@ -61,6 +66,7 @@ struct Binding {
     workspace_id: String,
     fingerprint: String,
     context: SharedState,
+    context_lock: Option<Arc<Mutex<WorkspaceContextPin>>>,
     lock_key: String,
     session_key_source: SessionKeySource,
     last_used: Instant,
@@ -85,6 +91,17 @@ struct GatewayPermit {
 struct RouteTarget {
     context: SharedState,
     lock_key: String,
+    context_summary: Option<Value>,
+}
+
+#[derive(Clone)]
+struct BindingSnapshot {
+    workspace_id: String,
+    fingerprint: String,
+    context: SharedState,
+    context_lock: Option<Arc<Mutex<WorkspaceContextPin>>>,
+    lock_key: String,
+    session_key_source: SessionKeySource,
 }
 
 pub struct GatewayRouter {
@@ -327,11 +344,7 @@ impl GatewayRouter {
 
     #[allow(dead_code)]
     pub fn select_workspace(&self, session_key: &str, workspace_id: &str) -> Value {
-        self.select_workspace_with_source(
-            session_key,
-            workspace_id,
-            SessionKeySource::McpTransport,
-        )
+        self.select_workspace_with_source(session_key, workspace_id, SessionKeySource::McpTransport)
     }
 
     fn select_workspace_with_source(
@@ -398,6 +411,7 @@ impl GatewayRouter {
                 workspace_id: target.id.clone(),
                 fingerprint,
                 context,
+                context_lock: None,
                 lock_key,
                 session_key_source: source,
                 last_used: Instant::now(),
@@ -559,10 +573,21 @@ impl GatewayRouter {
             ));
         }
         binding.last_used = Instant::now();
-        Ok(RouteTarget {
+        let context_lock = binding.context_lock.clone();
+        let mut target = RouteTarget {
             context: binding.context.clone(),
             lock_key: binding.lock_key.clone(),
-        })
+            context_summary: None,
+        };
+        drop(bindings);
+        if let Some(context_lock) = context_lock {
+            let mut pin = context_lock.lock().expect("workspace context lock");
+            match pin.validate() {
+                Ok(_) => target.context_summary = Some(pin.snapshot("valid", None)),
+                Err(error) => return Err(error.tool_value(Some(&pin))),
+            }
+        }
+        Ok(target)
     }
 
     fn acquire_permit(&self, lock_key: &str, mutating: bool) -> Option<GatewayPermit> {
@@ -650,7 +675,16 @@ impl GatewayRouter {
         host: &WorkspaceProfile,
         target: &WorkspaceProfile,
     ) -> Result<SharedState, Value> {
-        let workspace = Workspace::new(PathBuf::from(&target.path)).map_err(|error| {
+        self.build_context_at_root(host, target, PathBuf::from(&target.path))
+    }
+
+    fn build_context_at_root(
+        &self,
+        host: &WorkspaceProfile,
+        target: &WorkspaceProfile,
+        root: PathBuf,
+    ) -> Result<SharedState, Value> {
+        let workspace = Workspace::new(root).map_err(|error| {
             tool_err_code("workspace_unavailable", error.to_string(), "gateway")
         })?;
         let host_policy = PolicySettings::from_runtime(&host.runtime);
@@ -663,6 +697,64 @@ impl GatewayRouter {
             target.runtime.tool_profile.clone(),
             policy.permission_mode.clone(),
         )))
+    }
+
+    fn binding_snapshot(
+        &self,
+        session_key: &str,
+    ) -> Result<(WorkspaceProfile, WorkspaceProfile, BindingSnapshot), Value> {
+        let profiles = self.profiles();
+        let host = self.host(&profiles)?;
+        let mut bindings = self.bindings.lock().expect("gateway binding lock");
+        evict_expired(&mut bindings);
+        let Some(binding) = bindings.get_mut(session_key) else {
+            return Err(tool_err_code(
+                "workspace_not_selected",
+                "Select a workspace for this MCP session first.",
+                "gateway",
+            ));
+        };
+        let Some(target) = profiles.get(&binding.workspace_id).cloned() else {
+            bindings.remove(session_key);
+            return Err(tool_err_code(
+                "workspace_unavailable",
+                "Selected workspace is unavailable.",
+                "gateway",
+            ));
+        };
+        if !host
+            .gateway
+            .workspace_ids
+            .iter()
+            .any(|id| id == &binding.workspace_id)
+        {
+            bindings.remove(session_key);
+            return Err(tool_err_code(
+                "workspace_not_allowed",
+                "Selected workspace is no longer in the host allowlist.",
+                "gateway",
+            ));
+        }
+        if binding_fingerprint(&host, &target) != binding.fingerprint
+            || !PathBuf::from(&target.path).is_dir()
+        {
+            bindings.remove(session_key);
+            return Err(tool_err_code(
+                "workspace_changed",
+                "Workspace configuration changed; select it again.",
+                "gateway",
+            ));
+        }
+        binding.last_used = Instant::now();
+        let snapshot = BindingSnapshot {
+            workspace_id: binding.workspace_id.clone(),
+            fingerprint: binding.fingerprint.clone(),
+            context: binding.context.clone(),
+            context_lock: binding.context_lock.clone(),
+            lock_key: binding.lock_key.clone(),
+            session_key_source: binding.session_key_source,
+        };
+        Ok((host, target, snapshot))
     }
 
     #[allow(dead_code)]
@@ -702,6 +794,9 @@ impl GatewayRouter {
                     )
                 }),
             "get_selected_workspace" => self.selected_workspace(session_key),
+            "pin_workspace_context" => self.pin_workspace_context(session_key, args),
+            "get_workspace_context" => self.get_workspace_context(session_key),
+            "unpin_workspace_context" => self.unpin_workspace_context(session_key, args),
             _ => tool_err_code("INVALID_ARGUMENT", "Unknown gateway tool.", "validation"),
         }
     }
@@ -722,6 +817,13 @@ impl GatewayRouter {
 struct BindingView {
     workspace_id: String,
     session_key_source: SessionKeySource,
+}
+
+fn same_binding_context(left: &BindingSnapshot, right: &BindingSnapshot) -> bool {
+    left.workspace_id == right.workspace_id
+        && left.fingerprint == right.fingerprint
+        && left.lock_key == right.lock_key
+        && Arc::ptr_eq(&left.context, &right.context)
 }
 
 fn normalize_session_identifier(value: Option<String>) -> Option<String> {
@@ -780,7 +882,14 @@ fn workspace_hint_matches(profile: &WorkspaceProfile, hint: &str) -> bool {
     profile_path
         .file_name()
         .and_then(|name| name.to_str())
-        .is_some_and(|name| name.eq_ignore_ascii_case(hint_path.file_name().and_then(|v| v.to_str()).unwrap_or(hint)))
+        .is_some_and(|name| {
+            name.eq_ignore_ascii_case(
+                hint_path
+                    .file_name()
+                    .and_then(|v| v.to_str())
+                    .unwrap_or(hint),
+            )
+        })
 }
 
 fn binding_success(
@@ -882,7 +991,7 @@ fn restrictive_permission_mode(host: &str, target: &str) -> String {
 }
 
 pub fn gateway_tools() -> Vec<Value> {
-    vec![
+    let mut tools = vec![
         json!({
             "name": "list_workspaces",
             "title": "List workspaces",
@@ -916,17 +1025,17 @@ pub fn gateway_tools() -> Vec<Value> {
             "inputSchema": {"type": "object", "additionalProperties": false},
             "annotations": {"readOnlyHint": true, "destructiveHint": false, "idempotentHint": true, "openWorldHint": false}
         }),
-    ]
+    ];
+    tools.extend(workspace_context_gateway::tools());
+    tools
 }
 
 pub fn is_gateway_tool(name: &str) -> bool {
-    matches!(
-        name,
-        "list_workspaces"
-            | "bind_workspace"
-            | "select_workspace"
-            | "get_selected_workspace"
-    )
+    workspace_context_gateway::is_tool(name)
+        || matches!(
+            name,
+            "list_workspaces" | "bind_workspace" | "select_workspace" | "get_selected_workspace"
+        )
 }
 
 #[allow(dead_code)]
@@ -970,11 +1079,13 @@ pub fn handle_gateway_request_with_source(
                 } else {
                     prompt.as_str()
                 };
+                let context_prompt = "For worktree development, call pin_workspace_context with the exact existing worktree root and expected branch before any project tool. While pinned, get_workspace_context is the authoritative execution root: stop on WORKSPACE_CONTEXT_MISMATCH or WORKSPACE_CONTEXT_EXPIRED and never fall back to the configured parent workspace. Before claiming completion, call get_workspace_context, git_status, and git_diff; affected_files without read-back and Git evidence is not proof that a patch reached disk.";
                 if let Some(value) = response
                     .get_mut("result")
                     .and_then(|result| result.get_mut("instructions"))
                 {
-                    *value = Value::String(format!("{gateway_prompt} {instructions}"));
+                    *value =
+                        Value::String(format!("{gateway_prompt} {context_prompt} {instructions}"));
                 }
             }
             response
@@ -1045,9 +1156,8 @@ pub fn handle_gateway_request_with_source(
                     });
                 }
             };
-            let mutating = crate::tools::registry::MUTATING_TOOLS.contains(
-                &crate::tools::registry::canonical_tool_name(name),
-            );
+            let mutating = crate::tools::registry::MUTATING_TOOLS
+                .contains(&crate::tools::registry::canonical_tool_name(name));
             let Some(_permit) = router.acquire_permit(&target.lock_key, mutating) else {
                 return json!({
                     "jsonrpc": "2.0",
@@ -1063,8 +1173,44 @@ pub fn handle_gateway_request_with_source(
                     )
                 });
             };
+            let target = match router.route_for(session_key, name) {
+                Ok(current)
+                    if current.lock_key == target.lock_key
+                        && Arc::ptr_eq(&current.context, &target.context) =>
+                {
+                    current
+                }
+                Ok(_) => {
+                    let structured = tool_err_code(
+                        "WORKSPACE_CONTEXT_MISMATCH",
+                        "The workspace context changed while this request was waiting; retry after checking the context.",
+                        "workspace_context",
+                    );
+                    return json!({
+                        "jsonrpc": "2.0",
+                        "id": id,
+                        "result": crate::tools::wrap_mcp_tool_result(name, &args, structured)
+                    });
+                }
+                Err(structured) => {
+                    return json!({
+                        "jsonrpc": "2.0",
+                        "id": id,
+                        "result": crate::tools::wrap_mcp_tool_result(name, &args, structured)
+                    });
+                }
+            };
             let request_body = body_with_session_metadata(body, session_key);
             let mut response = handle_request(&target.context, &request_body);
+            if let Some(context_summary) = target.context_summary {
+                if let Some(structured) = response
+                    .get_mut("result")
+                    .and_then(|result| result.get_mut("structuredContent"))
+                    .and_then(Value::as_object_mut)
+                {
+                    structured.insert("workspace_context".into(), context_summary);
+                }
+            }
             if name == "server_info" {
                 if let Some(structured) = response
                     .get_mut("result")
@@ -1122,6 +1268,7 @@ pub fn rpc_error(id: Value, code: &str, message: &str) -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::mcp::workspace_context_tests::{git, repository};
     use crate::workspace::{GatewayConfig, WorkspaceProfile};
 
     fn profile(
@@ -1223,6 +1370,34 @@ mod tests {
             None,
         );
         assert_eq!(response["result"]["structuredContent"]["ok"], true);
+    }
+
+    #[test]
+    fn gateway_initialize_instructs_worktree_pin_and_final_verification() {
+        let workspace = tempfile::tempdir().expect("workspace");
+        let host = profile(workspace.path(), "host", true, vec!["host".into()]);
+        let router = GatewayRouter::from_profiles(host, vec![]);
+        let context = Arc::new(
+            ToolContext::for_test(
+                workspace.path().to_path_buf(),
+                workspace.path().to_path_buf(),
+            )
+            .expect("context"),
+        );
+        let response = handle_gateway_request(
+            &router,
+            &context,
+            &json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}),
+            Some("session"),
+        );
+        let instructions = response["result"]["instructions"]
+            .as_str()
+            .expect("instructions");
+        assert!(instructions.contains("pin_workspace_context"));
+        assert!(instructions.contains("get_workspace_context"));
+        assert!(instructions.contains("WORKSPACE_CONTEXT_MISMATCH"));
+        assert!(instructions.contains("git_status"));
+        assert!(instructions.contains("affected_files"));
     }
 
     #[test]
@@ -1377,7 +1552,10 @@ mod tests {
             .resolve_session_identity(SessionIdentifiers::default(), true)
             .expect("generated identity");
         assert_eq!(resolved.source, SessionKeySource::ServerGenerated);
-        assert_eq!(resolved.transport_id.as_deref(), Some(resolved.key.as_str()));
+        assert_eq!(
+            resolved.transport_id.as_deref(),
+            Some(resolved.key.as_str())
+        );
         assert!(!resolved.key.is_empty());
     }
 
@@ -1401,13 +1579,13 @@ mod tests {
         );
         assert_eq!(bound["ok"], true);
         assert_eq!(bound["binding"]["locked"], true);
-        assert_eq!(bound["binding"]["session_key_source"], "openai_conversation");
-
-        let locked = router.bind_workspace(
-            "conversation",
-            "host",
-            SessionKeySource::OpenAiConversation,
+        assert_eq!(
+            bound["binding"]["session_key_source"],
+            "openai_conversation"
         );
+
+        let locked =
+            router.bind_workspace("conversation", "host", SessionKeySource::OpenAiConversation);
         assert_eq!(locked["error"]["code"], "workspace_locked");
     }
 
@@ -1446,6 +1624,126 @@ mod tests {
                 .context_for("conversation-b", "get_default_cwd")
                 .expect("second context")
                 .workspace_path()
+        );
+    }
+
+    #[test]
+    fn pinned_context_routes_patch_to_worktree_and_unpins_to_configured_root() {
+        let (configured, _main, worktree) = repository();
+        let host = profile(configured.path(), "host", true, vec!["host".into()]);
+        let router = GatewayRouter::from_profiles(host, vec![]);
+        assert_eq!(router.select_workspace("session", "host")["ok"], true);
+
+        let pinned = router.tool_result(
+            "session",
+            "pin_workspace_context",
+            &json!({
+                "path": worktree,
+                "expected_branch": "feature/context-lock",
+                "expires_in_minutes": 5
+            }),
+        );
+        assert_eq!(pinned["ok"], true);
+        assert_eq!(pinned["locked"], true);
+        let active = router
+            .context_for("session", "apply_patch")
+            .expect("pinned context");
+        assert_eq!(
+            active.workspace.root().canonicalize().expect("active root"),
+            worktree.canonicalize().expect("worktree root")
+        );
+
+        let host_context = Arc::new(
+            ToolContext::for_test(
+                configured.path().to_path_buf(),
+                configured.path().join("harness"),
+            )
+            .expect("host context"),
+        );
+        let response = handle_gateway_request(
+            &router,
+            &host_context,
+            &json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "tools/call",
+                "params": {
+                    "name": "apply_patch",
+                    "arguments": {
+                        "patch": "*** Begin Patch\n*** Add File: pinned.txt\n+pinned-root\n*** End Patch\n"
+                    }
+                }
+            }),
+            Some("session"),
+        );
+        let structured = &response["result"]["structuredContent"];
+        assert_eq!(structured["ok"], true);
+        assert_eq!(structured["verified"], true);
+        assert_eq!(structured["workspace_context"]["status"], "valid");
+        assert!(worktree.join("pinned.txt").is_file());
+        assert!(!configured.path().join("pinned.txt").exists());
+
+        let unpinned = router.tool_result(
+            "session",
+            "unpin_workspace_context",
+            &json!({"confirm": true}),
+        );
+        assert_eq!(unpinned["ok"], true);
+        assert_eq!(unpinned["locked"], false);
+        let restored = router
+            .context_for("session", "get_default_cwd")
+            .expect("restored context");
+        assert_eq!(
+            restored
+                .workspace
+                .root()
+                .canonicalize()
+                .expect("restored root"),
+            configured.path().canonicalize().expect("configured root")
+        );
+    }
+
+    #[test]
+    fn conversations_pin_distinct_worktrees_with_distinct_contexts_and_locks() {
+        let (configured, main, first) = repository();
+        let second = configured.path().join("second");
+        git(
+            &main,
+            &[
+                "worktree",
+                "add",
+                "-b",
+                "feature/second",
+                second.to_str().expect("second path"),
+            ],
+        );
+        let host = profile(configured.path(), "host", true, vec!["host".into()]);
+        let router = GatewayRouter::from_profiles(host, vec![]);
+        assert_eq!(router.select_workspace("one", "host")["ok"], true);
+        assert_eq!(router.select_workspace("two", "host")["ok"], true);
+        assert_eq!(
+            router.tool_result(
+                "one",
+                "pin_workspace_context",
+                &json!({"path": first, "expected_branch": "feature/context-lock"}),
+            )["ok"],
+            true
+        );
+        assert_eq!(
+            router.tool_result(
+                "two",
+                "pin_workspace_context",
+                &json!({"path": second, "expected_branch": "feature/second"}),
+            )["ok"],
+            true
+        );
+        let first_target = router.route_for("one", "get_default_cwd").expect("first");
+        let second_target = router.route_for("two", "get_default_cwd").expect("second");
+        assert_ne!(first_target.lock_key, second_target.lock_key);
+        assert!(!Arc::ptr_eq(&first_target.context, &second_target.context));
+        assert_ne!(
+            first_target.context.workspace_path(),
+            second_target.context.workspace_path()
         );
     }
 }

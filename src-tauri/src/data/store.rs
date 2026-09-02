@@ -294,8 +294,10 @@ mod tests {
             WorkspaceProfile::new("C:/workspace/target".into(), Some("target".into()));
         target.id = "target".into();
 
-        let mut data = AppData::default();
-        data.profiles = vec![host, target];
+        let mut data = AppData {
+            profiles: vec![host, target],
+            ..AppData::default()
+        };
         data.workspace_secrets
             .entry("target".into())
             .or_default()
@@ -317,8 +319,10 @@ mod tests {
         host.gateway.enabled = true;
         host.gateway.workspace_ids = vec!["host".into(), "target".into()];
 
-        let mut data = AppData::default();
-        data.profiles = vec![host];
+        let mut data = AppData {
+            profiles: vec![host],
+            ..AppData::default()
+        };
 
         assert!(remove_workspace_data(&mut data, "missing").is_none());
         assert_eq!(

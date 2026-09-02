@@ -149,6 +149,7 @@ mod tests {
         assert!(instructions.contains("before the final response"));
         assert!(instructions.contains("checkpoint returns ok=true"));
         assert!(instructions.contains("not automatic background persistence"));
+        assert!(!instructions.contains("pin_workspace_context"));
     }
 
     #[test]

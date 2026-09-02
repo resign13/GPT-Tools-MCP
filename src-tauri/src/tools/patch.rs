@@ -97,11 +97,16 @@ pub fn apply_patch(ctx: &ToolContext, args: &Value) -> Result<Value, WorkspaceEr
     let files_deleted = affected_paths(&affected, "delete");
 
     if !dry_run {
-        let _transaction_backups = commit_staged(ws, &staged)?;
+        let transaction_backups = commit_staged(ws, &staged)?;
+        if let Err(error) = verify_staged(ws, &staged) {
+            restore_backups(&transaction_backups);
+            return Err(error);
+        }
         let change_id = Uuid::new_v4().simple().to_string();
         return Ok(tool_ok(json!({
             "dry_run": false,
             "clean": true,
+            "verified": true,
             "change_id": change_id,
             "summary": summaries.join("\n"),
             "affected_files": affected,
@@ -510,6 +515,36 @@ fn restore_backups(backups: &HashMap<PathBuf, Option<Vec<u8>>>) {
     }
 }
 
+fn verify_staged(
+    ws: &Workspace,
+    staged: &HashMap<String, Option<String>>,
+) -> Result<(), WorkspaceError> {
+    for (relative, expected) in staged {
+        let path = ws.resolve_for_write(relative)?.path;
+        match expected {
+            Some(expected) => {
+                let actual = fs::read_to_string(&path).map_err(|error| {
+                    patch_failed(format!(
+                        "Patch verification could not read {relative}: {error}"
+                    ))
+                })?;
+                if &actual != expected {
+                    return Err(patch_failed(format!(
+                        "Patch verification failed for {relative}."
+                    )));
+                }
+            }
+            None if path.exists() => {
+                return Err(patch_failed(format!(
+                    "Patch verification expected {relative} to be deleted."
+                )));
+            }
+            None => {}
+        }
+    }
+    Ok(())
+}
+
 fn replace_file(temp: &PathBuf, path: &PathBuf) -> Result<(), std::io::Error> {
     #[cfg(windows)]
     {
@@ -640,6 +675,7 @@ mod tests {
             }),
         )
         .expect("replace file");
+        assert_eq!(result["verified"], true);
         assert_eq!(result["files_modified"], json!(["main.rs"]));
         assert_eq!(
             std::fs::read_to_string(context.workspace.root().join("main.rs")).unwrap(),
@@ -662,5 +698,13 @@ mod tests {
             std::fs::read_to_string(context.workspace.root().join("main.rs")).unwrap(),
             "old\n"
         );
+    }
+
+    #[test]
+    fn verification_rejects_content_that_does_not_match_disk() {
+        let (_workspace, _harness, context) = context_with_file();
+        let staged = HashMap::from([("main.rs".to_string(), Some("unexpected\n".to_string()))]);
+        let error = verify_staged(&context.workspace, &staged).expect_err("verification mismatch");
+        assert_eq!(error.to_error_value()["code"], "PATCH_FAILED");
     }
 }

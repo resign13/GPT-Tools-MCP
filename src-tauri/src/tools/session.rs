@@ -52,6 +52,14 @@ impl SessionStore {
             .expect("sessions lock")
             .remove(session_id);
     }
+
+    pub fn has_active_sessions(&self) -> bool {
+        self.sessions
+            .lock()
+            .expect("sessions lock")
+            .values()
+            .any(|session| !session.has_exited())
+    }
 }
 
 pub struct ExecSession {
