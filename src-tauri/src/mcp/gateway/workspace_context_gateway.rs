@@ -55,7 +55,13 @@ impl GatewayRouter {
             Ok(pin) => pin,
             Err(error) => return error.tool_value(None),
         };
-        let context = match self.build_context_at_root(&host, &target, pin.active_root.clone()) {
+        let identity = pin.git_identity();
+        let context = match self.build_context_at_root(
+            &host,
+            &target,
+            pin.active_root.clone(),
+            Some(identity),
+        ) {
             Ok(context) => context,
             Err(error) => return error,
         };
@@ -129,14 +135,10 @@ impl GatewayRouter {
         match pin.validate() {
             Ok(_) => tool_ok(pin.snapshot("valid", None)),
             Err(error) => {
-                let status = if error.code == "WORKSPACE_CONTEXT_EXPIRED" {
-                    "expired"
-                } else {
-                    "mismatch"
-                };
-                let mut value = pin.snapshot(status, Some(&error.message));
-                value["drift_error"] = json!({"code": error.code, "message": error.message});
-                tool_ok(value)
+                // A failed validation must be a failed tool result.  Returning
+                // `ok: true` with an embedded drift_error lets a caller ignore
+                // the authoritative context check and continue on a stale pin.
+                error.tool_value(Some(&pin))
             }
         }
     }

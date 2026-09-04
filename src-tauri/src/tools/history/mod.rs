@@ -1,6 +1,6 @@
 mod markdown;
 mod model;
-mod storage;
+pub(crate) mod storage;
 
 use std::fs;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -716,8 +716,7 @@ fn required_checkpoint_argument(args: &Value, name: &str) -> WorkspaceResult<Str
 }
 
 fn resolve_dir(ctx: &ToolContext, args: &Value) -> WorkspaceResult<std::path::PathBuf> {
-    storage::resolve_history_dir(
-        &ctx.workspace,
+    ctx.resolve_history_dir(
         args.get("workspace_root").and_then(Value::as_str),
         args.get("history_dir").and_then(Value::as_str),
     )
@@ -784,7 +783,7 @@ fn history_error(
 }
 
 fn history_dir_display(ctx: &ToolContext, path: &std::path::Path) -> String {
-    crate::tools::workspace::relative_display(ctx.workspace.root(), path)
+    crate::tools::workspace::relative_display(ctx.execution_root().as_path(), path)
 }
 
 fn now_timestamp() -> String {

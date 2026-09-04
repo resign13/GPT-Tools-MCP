@@ -6,10 +6,11 @@ use serde_json::{json, Value};
 use uuid::Uuid;
 
 use crate::tools::context::ToolContext;
-use crate::tools::workspace::{tool_ok, Workspace, WorkspaceError};
+use crate::tools::workspace::{tool_ok, WorkspaceError};
+use crate::tools::PathIntent;
 
 pub fn apply_patch(ctx: &ToolContext, args: &Value) -> Result<Value, WorkspaceError> {
-    let ws = &ctx.workspace;
+    ctx.validate_execution_context()?;
     let patch = args
         .get("patch")
         .and_then(Value::as_str)
@@ -50,16 +51,19 @@ pub fn apply_patch(ctx: &ToolContext, args: &Value) -> Result<Value, WorkspaceEr
 
     let mut affected = Vec::new();
     let mut summaries = Vec::new();
-    let mut staged: HashMap<String, Option<String>> = HashMap::new();
+    // Keep absolute validated paths in the transaction. Re-resolving a display
+    // string from the workspace root is what previously allowed nested worktrees
+    // to drift back to the parent repository.
+    let mut staged: HashMap<PathBuf, Option<String>> = HashMap::new();
 
     for fp in &file_patches {
-        ws.reject_unsafe_text(&fp.path)?;
-        let resolved = if fp.is_new_file {
-            ws.resolve_for_write(&fp.path)?
-        } else {
-            ws.resolve_existing(&fp.path)?
-        };
-        ws.reject_write_symlink(&fp.path)?;
+        let resolved = ctx.resolve_for_write_from_default_cwd(&fp.path)?;
+        if !fp.is_new_file && !resolved.existed {
+            return Err(WorkspaceError::not_found(format!(
+                "File not found: {}",
+                fp.path
+            )));
+        }
 
         let original = if fp.is_new_file {
             // An Add File envelope is replacement content even when an earlier
@@ -68,14 +72,14 @@ pub fn apply_patch(ctx: &ToolContext, args: &Value) -> Result<Value, WorkspaceEr
         } else if resolved.existed {
             fs::read_to_string(&resolved.path)
                 .map_err(|_| WorkspaceError::not_found(format!("File not found: {}", fp.path)))?
-        } else if fp.is_new_file || fp.is_deleted {
+        } else if fp.is_deleted {
             String::new()
         } else {
             return Err(patch_failed(format!("File not found: {}", fp.path)));
         };
 
         if fp.is_deleted {
-            staged.insert(resolved.display.clone(), None);
+            staged.insert(resolved.path.clone(), None);
             affected.push(json!({ "path": resolved.display, "operation": "delete" }));
             summaries.push(format!("D {}", resolved.display));
             continue;
@@ -83,7 +87,7 @@ pub fn apply_patch(ctx: &ToolContext, args: &Value) -> Result<Value, WorkspaceEr
 
         let updated = apply_hunks(&original, &fp.hunks)?;
         let op = if resolved.existed { "update" } else { "add" };
-        staged.insert(resolved.display.clone(), Some(updated));
+        staged.insert(resolved.path.clone(), Some(updated));
         affected.push(json!({ "path": resolved.display, "operation": op }));
         summaries.push(format!(
             "{} {}",
@@ -97,11 +101,12 @@ pub fn apply_patch(ctx: &ToolContext, args: &Value) -> Result<Value, WorkspaceEr
     let files_deleted = affected_paths(&affected, "delete");
 
     if !dry_run {
-        let transaction_backups = commit_staged(ws, &staged)?;
-        if let Err(error) = verify_staged(ws, &staged) {
+        let transaction_backups = commit_staged(ctx, &staged)?;
+        if let Err(error) = verify_staged_with_context(ctx, &staged) {
             restore_backups(&transaction_backups);
             return Err(error);
         }
+        ctx.validate_execution_context()?;
         let change_id = Uuid::new_v4().simple().to_string();
         return Ok(tool_ok(json!({
             "dry_run": false,
@@ -413,8 +418,8 @@ fn find_hunk_position(lines: &[String], pattern: &[String], start: usize) -> Opt
 }
 
 fn commit_staged(
-    ws: &Workspace,
-    staged: &HashMap<String, Option<String>>,
+    ctx: &ToolContext,
+    staged: &HashMap<PathBuf, Option<String>>,
 ) -> Result<HashMap<PathBuf, Option<Vec<u8>>>, WorkspaceError> {
     let staged_bytes = staged
         .iter()
@@ -425,23 +430,33 @@ fn commit_staged(
             )
         })
         .collect::<HashMap<_, _>>();
-    commit_staged_bytes(ws, &staged_bytes)
+    for (path, content) in staged {
+        ctx.validate_path(path, PathIntent::Write)?;
+        if content.is_none() && !path.exists() {
+            return Err(patch_failed(format!(
+                "Patch target does not exist: {}",
+                ctx.display_path(path)
+            )));
+        }
+    }
+    commit_staged_paths(ctx, &staged_bytes)
 }
 
-pub(crate) fn commit_staged_bytes(
-    ws: &Workspace,
-    staged: &HashMap<String, Option<Vec<u8>>>,
+fn commit_staged_paths(
+    ctx: &ToolContext,
+    staged: &HashMap<PathBuf, Option<Vec<u8>>>,
+) -> Result<HashMap<PathBuf, Option<Vec<u8>>>, WorkspaceError> {
+    ctx.validate_execution_context()?;
+    commit_staged_paths_unchecked(staged)
+}
+
+fn commit_staged_paths_unchecked(
+    staged: &HashMap<PathBuf, Option<Vec<u8>>>,
 ) -> Result<HashMap<PathBuf, Option<Vec<u8>>>, WorkspaceError> {
     let mut backups: HashMap<PathBuf, Option<Vec<u8>>> = HashMap::new();
     let mut temporary_files = HashMap::new();
-    for (rel, content) in staged {
-        ws.reject_protected_write_path(rel)?;
-        let resolved = if content.is_none() {
-            ws.resolve_existing(rel)?
-        } else {
-            ws.resolve_for_write(rel)?
-        };
-        let path = resolved.path.clone();
+    for (path, content) in staged {
+        let path = path.clone();
         backups.insert(
             path.clone(),
             if path.exists() && path.is_file() {
@@ -468,13 +483,8 @@ pub(crate) fn commit_staged_bytes(
         }
     }
 
-    for (rel, content) in staged {
-        let resolved = if content.is_none() {
-            ws.resolve_existing(rel)?
-        } else {
-            ws.resolve_for_write(rel)?
-        };
-        let path = resolved.path;
+    for (path, content) in staged {
+        let path = path.clone();
         let result = if content.is_some() {
             let temp = temporary_files
                 .get(&path)
@@ -515,8 +525,9 @@ fn restore_backups(backups: &HashMap<PathBuf, Option<Vec<u8>>>) {
     }
 }
 
+#[cfg(test)]
 fn verify_staged(
-    ws: &Workspace,
+    ws: &crate::tools::workspace::Workspace,
     staged: &HashMap<String, Option<String>>,
 ) -> Result<(), WorkspaceError> {
     for (relative, expected) in staged {
@@ -543,6 +554,38 @@ fn verify_staged(
         }
     }
     Ok(())
+}
+
+fn verify_staged_with_context(
+    ctx: &ToolContext,
+    staged: &HashMap<PathBuf, Option<String>>,
+) -> Result<(), WorkspaceError> {
+    ctx.validate_execution_context()?;
+    for (path, expected) in staged {
+        let path = ctx.validate_path(path, PathIntent::Write)?;
+        let display = ctx.display_path(&path);
+        match expected {
+            Some(expected) => {
+                let actual = fs::read_to_string(&path).map_err(|error| {
+                    patch_failed(format!(
+                        "Patch verification could not read {display}: {error}"
+                    ))
+                })?;
+                if &actual != expected {
+                    return Err(patch_failed(format!(
+                        "Patch verification failed for {display}."
+                    )));
+                }
+            }
+            None if path.exists() => {
+                return Err(patch_failed(format!(
+                    "Patch verification expected {display} to be deleted."
+                )));
+            }
+            None => {}
+        }
+    }
+    ctx.validate_execution_context()
 }
 
 fn replace_file(temp: &PathBuf, path: &PathBuf) -> Result<(), std::io::Error> {

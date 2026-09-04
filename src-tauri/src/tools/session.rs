@@ -1,17 +1,120 @@
 use std::collections::HashMap;
+use std::io;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use tokio::io::AsyncReadExt;
-use tokio::process::{Child, ChildStdin};
+use tokio::io::{AsyncRead, AsyncWrite};
+use tokio::process::Child;
 use tokio::sync::Mutex as AsyncMutex;
 use uuid::Uuid;
 
+#[cfg(windows)]
+use crate::security::exec_sandbox::{SandboxChild, SandboxProcess};
+use crate::tools::context::ToolContext;
 use crate::tools::workspace::{tool_ok, WorkspaceError};
 use serde_json::{json, Value};
 
 const SESSION_BUFFER_BYTES: usize = 1_048_576;
+
+pub(crate) type SessionStdin = Box<dyn AsyncWrite + Send + Unpin>;
+type SessionReader = Box<dyn AsyncRead + Send + Unpin>;
+
+enum ManagedProcess {
+    Tokio(Child),
+    #[cfg(windows)]
+    Sandbox(SandboxProcess),
+}
+
+pub(crate) struct ManagedChild {
+    process: ManagedProcess,
+    stdin: Option<SessionStdin>,
+    stdout: Option<SessionReader>,
+    stderr: Option<SessionReader>,
+}
+
+impl ManagedChild {
+    fn from_tokio(mut child: Child) -> Self {
+        let stdin = child
+            .stdin
+            .take()
+            .map(|stream| Box::new(stream) as SessionStdin);
+        let stdout = child
+            .stdout
+            .take()
+            .map(|stream| Box::new(stream) as SessionReader);
+        let stderr = child
+            .stderr
+            .take()
+            .map(|stream| Box::new(stream) as SessionReader);
+        Self {
+            process: ManagedProcess::Tokio(child),
+            stdin,
+            stdout,
+            stderr,
+        }
+    }
+
+    pub(crate) fn from_sandbox(child: SandboxChild) -> Self {
+        let (process, stdin, stdout, stderr) = child.into_parts();
+        Self {
+            process: ManagedProcess::Sandbox(process),
+            stdin: stdin.map(|stream| Box::new(stream) as SessionStdin),
+            stdout: stdout.map(|stream| Box::new(stream) as SessionReader),
+            stderr: stderr.map(|stream| Box::new(stream) as SessionReader),
+        }
+    }
+
+    fn take_stdin(&mut self) -> Option<SessionStdin> {
+        self.stdin.take()
+    }
+
+    fn take_stdout(&mut self) -> Option<SessionReader> {
+        self.stdout.take()
+    }
+
+    fn take_stderr(&mut self) -> Option<SessionReader> {
+        self.stderr.take()
+    }
+
+    fn id(&self) -> Option<u32> {
+        match &self.process {
+            ManagedProcess::Tokio(child) => child.id(),
+            #[cfg(windows)]
+            ManagedProcess::Sandbox(process) => process.id(),
+        }
+    }
+
+    fn start_kill(&mut self) -> io::Result<()> {
+        match &mut self.process {
+            ManagedProcess::Tokio(child) => child.start_kill(),
+            #[cfg(windows)]
+            ManagedProcess::Sandbox(process) => process.kill_tree(),
+        }
+    }
+
+    async fn wait(&mut self) -> io::Result<std::process::ExitStatus> {
+        match &mut self.process {
+            ManagedProcess::Tokio(child) => child.wait().await,
+            #[cfg(windows)]
+            ManagedProcess::Sandbox(process) => process.wait().await,
+        }
+    }
+
+    fn try_wait(&mut self) -> io::Result<Option<std::process::ExitStatus>> {
+        match &mut self.process {
+            ManagedProcess::Tokio(child) => child.try_wait(),
+            #[cfg(windows)]
+            ManagedProcess::Sandbox(process) => process.try_wait(),
+        }
+    }
+
+    #[cfg(windows)]
+    fn has_job(&self) -> bool {
+        matches!(self.process, ManagedProcess::Sandbox(_))
+    }
+}
 
 #[derive(Default)]
 pub struct SessionStore {
@@ -64,8 +167,8 @@ impl SessionStore {
 
 pub struct ExecSession {
     pub session_id: String,
-    pub(crate) child: AsyncMutex<Child>,
-    pub stdin: AsyncMutex<Option<ChildStdin>>,
+    pub(crate) child: AsyncMutex<ManagedChild>,
+    pub(crate) stdin: AsyncMutex<Option<SessionStdin>>,
     stdin_open: Mutex<bool>,
     interactive: bool,
     stdout: Mutex<Vec<u8>>,
@@ -77,6 +180,9 @@ pub struct ExecSession {
     exited: AtomicBool,
     termination_reason: Mutex<Option<String>>,
     reader_tasks: AsyncMutex<Vec<tauri::async_runtime::JoinHandle<()>>>,
+    execution_fingerprint: String,
+    sandbox_enforced: bool,
+    execution_boundary: &'static str,
 }
 
 impl ExecSession {
@@ -84,13 +190,52 @@ impl ExecSession {
         Self::new_with_mode(child, false)
     }
 
-    pub fn new_with_mode(mut child: Child, interactive: bool) -> Self {
+    pub fn new_with_mode(child: Child, interactive: bool) -> Self {
+        Self::new_with_mode_and_fingerprint(child, interactive, String::new())
+    }
+
+    pub fn new_with_mode_and_fingerprint(
+        child: Child,
+        interactive: bool,
+        execution_fingerprint: String,
+    ) -> Self {
+        Self::new_inner(
+            ManagedChild::from_tokio(child),
+            interactive,
+            execution_fingerprint,
+            false,
+            "policy_only",
+        )
+    }
+
+    #[cfg(windows)]
+    pub(crate) fn new_with_sandbox_child(
+        child: SandboxChild,
+        interactive: bool,
+        execution_fingerprint: String,
+    ) -> Self {
+        Self::new_inner(
+            ManagedChild::from_sandbox(child),
+            interactive,
+            execution_fingerprint,
+            true,
+            "windows_appcontainer",
+        )
+    }
+
+    fn new_inner(
+        mut managed_child: ManagedChild,
+        interactive: bool,
+        execution_fingerprint: String,
+        sandbox_enforced: bool,
+        execution_boundary: &'static str,
+    ) -> Self {
         let session_id = Uuid::new_v4().to_string();
-        let stdin = child.stdin.take();
+        let stdin = managed_child.take_stdin();
         let stdin_open = stdin.is_some();
         Self {
             session_id,
-            child: AsyncMutex::new(child),
+            child: AsyncMutex::new(managed_child),
             stdin: AsyncMutex::new(stdin),
             stdin_open: Mutex::new(stdin_open),
             interactive,
@@ -103,17 +248,24 @@ impl ExecSession {
             exited: AtomicBool::new(false),
             termination_reason: Mutex::new(None),
             reader_tasks: AsyncMutex::new(Vec::new()),
+            execution_fingerprint,
+            sandbox_enforced,
+            execution_boundary,
         }
+    }
+
+    fn belongs_to_context(&self, fingerprint: &str) -> bool {
+        self.execution_fingerprint.is_empty() || self.execution_fingerprint == fingerprint
     }
 
     pub async fn spawn_readers(self: &Arc<Self>) {
         let stdout = {
             let mut guard = self.child.lock().await;
-            guard.stdout.take()
+            guard.take_stdout()
         };
         let stderr = {
             let mut guard = self.child.lock().await;
-            guard.stderr.take()
+            guard.take_stderr()
         };
         if let Some(stream) = stdout {
             let session = Arc::clone(self);
@@ -264,6 +416,8 @@ impl ExecSession {
             "exit_code": exit_code,
             "transport_ok": true,
             "command_ok": command_ok,
+            "sandbox_enforced": self.sandbox_enforced,
+            "execution_boundary": self.execution_boundary,
             "stdout": stdout.content,
             "stderr": stderr.content,
             "stdout_truncated": stdout.truncated,
@@ -298,7 +452,7 @@ fn truncate_tail(bytes: &[u8], max_bytes: usize) -> Truncated {
     }
 }
 
-pub fn read_output(store: &SessionStore, args: &Value) -> Result<Value, WorkspaceError> {
+pub fn read_output(ctx: &ToolContext, args: &Value) -> Result<Value, WorkspaceError> {
     let output_ref = args
         .get("output_ref")
         .and_then(Value::as_str)
@@ -316,7 +470,8 @@ pub fn read_output(store: &SessionStore, args: &Value) -> Result<Value, Workspac
             "output_ref stream must be stdout, stderr, or full",
         ));
     }
-    let session = store.get(session_id)?;
+    let session = ctx.sessions.get(session_id)?;
+    ensure_context_match(ctx, &session)?;
     tauri::async_runtime::block_on(session.refresh_status());
 
     let requested_stream = args.get("stream").and_then(Value::as_str).unwrap_or("");
@@ -363,12 +518,13 @@ pub fn read_output(store: &SessionStore, args: &Value) -> Result<Value, Workspac
     })))
 }
 
-pub fn write_stdin(store: &SessionStore, args: &Value) -> Result<Value, WorkspaceError> {
+pub fn write_stdin(ctx: &ToolContext, args: &Value) -> Result<Value, WorkspaceError> {
     let session_id = args
         .get("session_id")
         .and_then(Value::as_str)
         .ok_or_else(|| WorkspaceError::invalid_argument("session_id is required"))?;
-    let session = store.get(session_id)?;
+    let session = ctx.sessions.get(session_id)?;
+    ensure_context_match(ctx, &session)?;
     let chars = args.get("chars").and_then(Value::as_str).unwrap_or("");
     let max_output_bytes = args
         .get("max_output_bytes")
@@ -421,12 +577,13 @@ pub fn write_stdin(store: &SessionStore, args: &Value) -> Result<Value, Workspac
     Ok(tool_ok(session.snapshot(max_output_bytes)))
 }
 
-pub fn kill_session(store: &SessionStore, args: &Value) -> Result<Value, WorkspaceError> {
+pub fn kill_session(ctx: &ToolContext, args: &Value) -> Result<Value, WorkspaceError> {
     let session_id = args
         .get("session_id")
         .and_then(Value::as_str)
         .ok_or_else(|| WorkspaceError::invalid_argument("session_id is required"))?;
-    let session = store.get(session_id)?;
+    let session = ctx.sessions.get(session_id)?;
+    ensure_context_match(ctx, &session)?;
     let max_output_bytes = args
         .get("max_output_bytes")
         .and_then(Value::as_u64)
@@ -446,11 +603,23 @@ pub fn kill_session(store: &SessionStore, args: &Value) -> Result<Value, Workspa
     if running {
         session.mark_termination_reason("killed");
         tauri::async_runtime::block_on(async {
-            let pid = {
+            let (pid, has_job) = {
                 let child = session.child.lock().await;
-                child.id()
+                (child.id(), {
+                    #[cfg(windows)]
+                    {
+                        child.has_job()
+                    }
+                    #[cfg(not(windows))]
+                    {
+                        false
+                    }
+                })
             };
-            if let Some(pid) = pid {
+            if has_job {
+                let mut child = session.child.lock().await;
+                let _ = child.start_kill();
+            } else if let Some(pid) = pid {
                 send_session_signal(pid, signal);
             } else {
                 let mut child = session.child.lock().await;
@@ -486,10 +655,27 @@ pub fn kill_session(store: &SessionStore, args: &Value) -> Result<Value, Workspa
     }
 
     if evicted {
-        store.remove(session_id);
+        ctx.sessions.remove(session_id);
     }
 
     Ok(tool_ok(payload))
+}
+
+fn ensure_context_match(ctx: &ToolContext, session: &ExecSession) -> Result<(), WorkspaceError> {
+    let fingerprint = ctx.execution_fingerprint();
+    if session.belongs_to_context(&fingerprint) {
+        return Ok(());
+    }
+    Err(WorkspaceError::ToolDetails {
+        code: "WORKSPACE_CONTEXT_MISMATCH",
+        message: "The command session belongs to a different execution context.".into(),
+        category: "workspace_context",
+        retryable: true,
+        details: json!({
+            "session_fingerprint": "redacted",
+            "current_fingerprint": fingerprint,
+        }),
+    })
 }
 
 #[cfg(unix)]

@@ -40,12 +40,15 @@ pub fn resolve_history_dir(
         let candidate = if requested_path.is_absolute() {
             requested_path.to_path_buf()
         } else {
-            workspace.root().join(requested_path)
+            workspace.active_root().join(requested_path)
         };
         let requested = candidate
             .canonicalize()
             .map_err(|_| WorkspaceError::invalid_argument("workspace_root does not exist"))?;
-        if requested != workspace.root() {
+        // A pinned worktree keeps the configured repository root as the
+        // public workspace_root for compatibility, while all history data
+        // must still be stored under the active execution root below.
+        if requested != workspace.active_root() && requested != workspace.repository_root() {
             return Err(WorkspaceError::path_outside_workspace());
         }
     }
@@ -55,7 +58,7 @@ pub fn resolve_history_dir(
         return Err(WorkspaceError::path_outside_workspace());
     }
     let candidate = workspace
-        .root()
+        .active_root()
         .join(raw.replace('/', std::path::MAIN_SEPARATOR_STR));
     ensure_safe_candidate(workspace, &candidate)?;
     if candidate.exists() && !candidate.is_dir() {
@@ -71,7 +74,7 @@ fn ensure_safe_candidate(workspace: &Workspace, candidate: &Path) -> WorkspaceRe
         let resolved = candidate
             .canonicalize()
             .map_err(|_| WorkspaceError::path_outside_workspace())?;
-        if !resolved.starts_with(workspace.root()) {
+        if !resolved.starts_with(workspace.active_root()) {
             return Err(WorkspaceError::path_outside_workspace());
         }
         return Ok(());
@@ -82,7 +85,7 @@ fn ensure_safe_candidate(workspace: &Workspace, candidate: &Path) -> WorkspaceRe
             let resolved = path
                 .canonicalize()
                 .map_err(|_| WorkspaceError::path_outside_workspace())?;
-            if !resolved.starts_with(workspace.root()) {
+            if !resolved.starts_with(workspace.active_root()) {
                 return Err(WorkspaceError::path_outside_workspace());
             }
             return Ok(());
@@ -162,7 +165,7 @@ pub fn scan(workspace: &Workspace, history_dir: &Path) -> WorkspaceResult<ScanRe
         }
         report.documents.push(HistoryDocument {
             number,
-            path: relative_display(workspace.root(), &path),
+            path: relative_display(workspace.active_root(), &path),
             session_key: markdown::metadata(&content, "Session key"),
             created_at: markdown::metadata(&content, "Created"),
             updated_at: markdown::metadata(&content, "Updated"),

@@ -4,11 +4,17 @@ use std::time::Duration;
 use regex::Regex;
 use serde_json::{json, Value};
 
-use crate::tools::workspace::{tool_ok, Workspace, WorkspaceError};
+use crate::tools::context::ToolContext;
+use crate::tools::workspace::{tool_ok, WorkspaceError};
 
-pub fn git_status(ws: &Workspace, args: &Value) -> Result<Value, WorkspaceError> {
-    let path = args.get("path").and_then(Value::as_str).unwrap_or(".");
-    let resolved = ws.resolve_existing(path)?;
+pub fn git_status(ctx: &ToolContext, args: &Value) -> Result<Value, WorkspaceError> {
+    ctx.validate_execution_context()?;
+    let path_filter = args
+        .get("path")
+        .and_then(Value::as_str)
+        .map(|path| ctx.resolve_git_pathspec(path))
+        .transpose()?;
+    let root = ctx.execution_root();
     let max_entries = args
         .get("max_entries")
         .and_then(Value::as_u64)
@@ -19,7 +25,7 @@ pub fn git_status(ws: &Workspace, args: &Value) -> Result<Value, WorkspaceError>
         .unwrap_or(true);
 
     let root_check = run_git(
-        &resolved.path,
+        &root,
         &["rev-parse", "--show-toplevel"],
         Duration::from_secs(10),
     )?;
@@ -36,7 +42,13 @@ pub fn git_status(ws: &Workspace, args: &Value) -> Result<Value, WorkspaceError>
     if !include_untracked {
         status_args.push("--untracked-files=no");
     }
-    let completed = run_git(&resolved.path, &status_args, Duration::from_secs(10))?;
+    if let Some(path) = path_filter.as_deref() {
+        if path != "." {
+            status_args.push("--");
+            status_args.push(path);
+        }
+    }
+    let completed = run_git(&root, &status_args, Duration::from_secs(10))?;
     if !completed.success && completed.exit_code != 0 {
         return Err(git_error(&completed.stderr));
     }
@@ -81,7 +93,7 @@ pub fn git_status(ws: &Workspace, args: &Value) -> Result<Value, WorkspaceError>
         }
     }
 
-    let head = git_rev_parse(&resolved.path, "HEAD").unwrap_or_default();
+    let head = git_rev_parse(&root, "HEAD").unwrap_or_default();
     Ok(tool_ok(json!({
         "is_repo": true,
         "branch": branch,
@@ -96,9 +108,13 @@ pub fn git_status(ws: &Workspace, args: &Value) -> Result<Value, WorkspaceError>
     })))
 }
 
-pub fn git_diff(ws: &Workspace, args: &Value) -> Result<Value, WorkspaceError> {
+pub fn git_diff(ctx: &ToolContext, args: &Value) -> Result<Value, WorkspaceError> {
+    ctx.validate_execution_context()?;
     let staged = args.get("staged").and_then(Value::as_bool).unwrap_or(false);
-    let unstaged = args.get("unstaged").and_then(Value::as_bool).unwrap_or(true);
+    let unstaged = args
+        .get("unstaged")
+        .and_then(Value::as_bool)
+        .unwrap_or(true);
     let context = args
         .get("context_lines")
         .and_then(Value::as_u64)
@@ -119,11 +135,13 @@ pub fn git_diff(ws: &Workspace, args: &Value) -> Result<Value, WorkspaceError> {
             }
         }
     }
-    for p in &path_filters {
-        ws.reject_unsafe_text(p)?;
-    }
+    let path_filters = path_filters
+        .iter()
+        .map(|path| ctx.resolve_git_pathspec(path))
+        .collect::<Result<Vec<_>, _>>()?;
+    let root = ctx.execution_root();
 
-    if !is_git_repo(ws.root()) {
+    if !is_git_repo(&root) {
         return Ok(tool_ok(json!({
             "diff": "",
             "files": [],
@@ -134,10 +152,10 @@ pub fn git_diff(ws: &Workspace, args: &Value) -> Result<Value, WorkspaceError> {
 
     let mut chunks = Vec::new();
     if unstaged {
-        chunks.push(run_git_diff(ws.root(), context, &path_filters, false)?);
+        chunks.push(run_git_diff(&root, context, &path_filters, false)?);
     }
     if staged {
-        chunks.push(run_git_diff(ws.root(), context, &path_filters, true)?);
+        chunks.push(run_git_diff(&root, context, &path_filters, true)?);
     }
     let mut combined = chunks.join("\n");
     if !combined.is_empty() && !combined.ends_with('\n') {
@@ -158,9 +176,10 @@ pub fn git_diff(ws: &Workspace, args: &Value) -> Result<Value, WorkspaceError> {
     })))
 }
 
-pub fn git_log(ws: &Workspace, args: &Value) -> Result<Value, WorkspaceError> {
+pub fn git_log(ctx: &ToolContext, args: &Value) -> Result<Value, WorkspaceError> {
+    ctx.validate_execution_context()?;
     let path = args.get("path").and_then(Value::as_str).unwrap_or(".");
-    let resolved = ws.resolve_existing(path)?;
+    let path_filter = ctx.resolve_git_pathspec(path)?;
     let ref_name = validate_git_ref(args.get("ref").and_then(Value::as_str).unwrap_or("HEAD"))?;
     let max_count = args
         .get("max_count")
@@ -173,7 +192,8 @@ pub fn git_log(ws: &Workspace, args: &Value) -> Result<Value, WorkspaceError> {
         .unwrap_or(0)
         .min(10_000) as usize;
 
-    if !is_git_repo(ws.root()) {
+    let root = ctx.execution_root();
+    if !is_git_repo(&root) {
         return Ok(tool_ok(json!({
             "is_repo": false,
             "commits": [],
@@ -185,11 +205,6 @@ pub fn git_log(ws: &Workspace, args: &Value) -> Result<Value, WorkspaceError> {
     let max_count_arg = format!("--max-count={}", max_count + 1);
     let skip_arg = format!("--skip={skip}");
     let pretty = "--pretty=format:%H%x1f%h%x1f%an%x1f%ae%x1f%ad%x1f%s%x1e";
-    let path_filter = if resolved.display.is_empty() {
-        ".".to_string()
-    } else {
-        resolved.display.clone()
-    };
     let mut cmd_args = vec![
         "log",
         max_count_arg.as_str(),
@@ -203,7 +218,7 @@ pub fn git_log(ws: &Workspace, args: &Value) -> Result<Value, WorkspaceError> {
         cmd_args.push(path_filter.as_str());
     }
 
-    let completed = run_git(ws.root(), &cmd_args, Duration::from_secs(10))?;
+    let completed = run_git(&root, &cmd_args, Duration::from_secs(10))?;
     if !completed.success {
         return Err(git_error(&completed.stderr));
     }
@@ -239,8 +254,10 @@ pub fn git_log(ws: &Workspace, args: &Value) -> Result<Value, WorkspaceError> {
     })))
 }
 
-pub fn git_show(ws: &Workspace, args: &Value) -> Result<Value, WorkspaceError> {
-    if !is_git_repo(ws.root()) {
+pub fn git_show(ctx: &ToolContext, args: &Value) -> Result<Value, WorkspaceError> {
+    ctx.validate_execution_context()?;
+    let root = ctx.execution_root();
+    if !is_git_repo(&root) {
         return Ok(tool_ok(json!({
             "is_repo": false,
             "content": "",
@@ -275,9 +292,10 @@ pub fn git_show(ws: &Workspace, args: &Value) -> Result<Value, WorkspaceError> {
             }
         }
     }
-    for p in &path_filters {
-        ws.reject_unsafe_text(p)?;
-    }
+    let path_filters = path_filters
+        .iter()
+        .map(|path| ctx.resolve_git_pathspec(path))
+        .collect::<Result<Vec<_>, _>>()?;
 
     let unified = format!("--unified={context}");
     let mut cmd_args = vec!["show", "--no-ext-diff", "--format=fuller", unified.as_str()];
@@ -292,7 +310,7 @@ pub fn git_show(ws: &Workspace, args: &Value) -> Result<Value, WorkspaceError> {
         }
     }
 
-    let completed = run_git(ws.root(), &cmd_args, Duration::from_secs(10))?;
+    let completed = run_git(&root, &cmd_args, Duration::from_secs(10))?;
     if !completed.success {
         return Err(git_error(&completed.stderr));
     }
@@ -315,12 +333,14 @@ pub fn git_show(ws: &Workspace, args: &Value) -> Result<Value, WorkspaceError> {
     })))
 }
 
-pub fn git_blame(ws: &Workspace, args: &Value) -> Result<Value, WorkspaceError> {
+pub fn git_blame(ctx: &ToolContext, args: &Value) -> Result<Value, WorkspaceError> {
+    ctx.validate_execution_context()?;
     let path = args
         .get("path")
         .and_then(Value::as_str)
         .ok_or_else(|| WorkspaceError::invalid_argument("path is required"))?;
-    let resolved = ws.resolve_existing(path)?;
+    let resolved = ctx.resolve_read_from_default_cwd(path)?;
+    let git_path = ctx.resolve_git_pathspec(path)?;
     if resolved.path.is_dir() {
         return Err(WorkspaceError::Tool {
             code: "IS_DIRECTORY",
@@ -329,10 +349,11 @@ pub fn git_blame(ws: &Workspace, args: &Value) -> Result<Value, WorkspaceError> 
             retryable: false,
         });
     }
-    if !is_git_repo(ws.root()) {
+    let root = ctx.execution_root();
+    if !is_git_repo(&root) {
         return Ok(tool_ok(json!({
             "is_repo": false,
-            "path": resolved.display,
+            "path": git_path,
             "lines": [],
             "truncated": false,
             "warnings": []
@@ -346,7 +367,10 @@ pub fn git_blame(ws: &Workspace, args: &Value) -> Result<Value, WorkspaceError> 
         .and_then(Value::as_u64)
         .unwrap_or(1)
         .max(1) as usize;
-    let end_line_arg = args.get("end_line").and_then(Value::as_u64).map(|v| v as usize);
+    let end_line_arg = args
+        .get("end_line")
+        .and_then(Value::as_u64)
+        .map(|v| v as usize);
     let max_lines = args
         .get("max_lines")
         .and_then(Value::as_u64)
@@ -372,9 +396,9 @@ pub fn git_blame(ws: &Workspace, args: &Value) -> Result<Value, WorkspaceError> 
         cmd_args.push(r);
     }
     cmd_args.push("--");
-    cmd_args.push(resolved.display.as_str());
+    cmd_args.push(git_path.as_str());
 
-    let completed = run_git(ws.root(), &cmd_args, Duration::from_secs(10))?;
+    let completed = run_git(&root, &cmd_args, Duration::from_secs(10))?;
     if !completed.success {
         return Err(git_error(&completed.stderr));
     }
@@ -387,7 +411,7 @@ pub fn git_blame(ws: &Workspace, args: &Value) -> Result<Value, WorkspaceError> 
 
     Ok(tool_ok(json!({
         "is_repo": true,
-        "path": resolved.display,
+        "path": git_path,
         "rev": ref_arg,
         "start_line": start_line,
         "end_line": final_line,
@@ -418,10 +442,7 @@ fn parse_git_blame_porcelain(output: &str) -> Vec<Value> {
         let parts: Vec<&str> = raw.split_whitespace().collect();
         if parts.len() >= 3 && commit_re.is_match(parts[0]) {
             current = serde_json::Map::new();
-            current.insert(
-                "commit".into(),
-                json!(parts[0].trim_start_matches('^')),
-            );
+            current.insert("commit".into(), json!(parts[0].trim_start_matches('^')));
             if parts[1].chars().all(|c| c.is_ascii_digit()) {
                 current.insert("original_line".into(), json!(parts[1].parse::<i64>().ok()));
             }
@@ -470,9 +491,17 @@ struct GitOutput {
     stderr: String,
 }
 
-fn run_git(cwd: &std::path::Path, args: &[&str], limit: Duration) -> Result<GitOutput, WorkspaceError> {
+fn run_git(
+    cwd: &std::path::Path,
+    args: &[&str],
+    limit: Duration,
+) -> Result<GitOutput, WorkspaceError> {
     let mut cmd = Command::new("git");
-    cmd.arg("-C").arg(cwd).args(args).stdout(Stdio::piped()).stderr(Stdio::piped());
+    cmd.arg("-C")
+        .arg(cwd)
+        .args(args)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
     #[cfg(windows)]
     {
         use std::os::windows::process::CommandExt;

@@ -13,8 +13,9 @@ use tokio::sync::{
 use crate::data::DataStore;
 use crate::mcp::server::{handle_request, SharedState};
 use crate::mcp::workspace_context::WorkspaceContextPin;
+use crate::tools::execution_context::GitIdentity;
 use crate::tools::policy::PolicySettings;
-use crate::tools::workspace::{tool_err_code, tool_ok, Workspace};
+use crate::tools::workspace::{tool_err, tool_err_code, tool_ok, Workspace};
 use crate::tools::ToolContext;
 use crate::workspace::WorkspaceProfile;
 
@@ -252,11 +253,17 @@ impl GatewayRouter {
         } else {
             None
         };
+        // OpenAI's conversation id is the logical identity.  A connector can
+        // reuse a transport id for a newly opened conversation, so an unknown
+        // OpenAI id must win over an already-known transport alias.  Once both
+        // aliases are known, the conflict check above still rejects a stale
+        // pair instead of allowing an old conversation to operate on the new
+        // binding.
         let canonical = openai_canonical
-            .or(transport_canonical)
             .or_else(|| openai.clone())
+            .or(transport_canonical)
             .or_else(|| transport.clone())
-            .or_else(|| generated.clone())
+            .or(generated.clone())
             .expect("session identity must have a canonical key");
         let source = if openai.is_some() {
             SessionKeySource::OpenAiConversation
@@ -395,6 +402,25 @@ impl GatewayRouter {
         let lock_key = workspace_lock_key(&target.path);
         let mut bindings = self.bindings.lock().expect("gateway binding lock");
         evict_expired(&mut bindings);
+        // `valid_binding` runs before context construction so the gateway lock
+        // is not held during filesystem/Git probing. Re-check while holding
+        // the lock immediately before insertion; otherwise two concurrent
+        // bind requests for one conversation could both observe an empty slot
+        // and the last writer would silently replace the first workspace.
+        if let Some(existing) = bindings.get(session_key) {
+            if existing.workspace_id == target.id && existing.fingerprint == fingerprint {
+                return binding_success(&target, existing.session_key_source, session_key);
+            }
+            if existing.workspace_id != target.id {
+                return tool_err_code(
+                    "workspace_locked",
+                    "This conversation is already bound to another workspace. Start a new conversation to switch workspaces.",
+                    "gateway",
+                );
+            }
+            bindings.remove(session_key);
+            self.remove_aliases_for(session_key);
+        }
         if bindings.len() >= MAX_BINDINGS && !bindings.contains_key(session_key) {
             if let Some(oldest) = bindings
                 .iter()
@@ -498,6 +524,11 @@ impl GatewayRouter {
             );
         }
         let Some(profile) = profiles.get(&binding.workspace_id) else {
+            self.bindings
+                .lock()
+                .expect("gateway binding lock")
+                .remove(session_key);
+            self.remove_aliases_for(session_key);
             return tool_err_code(
                 "workspace_unavailable",
                 "Selected workspace is unavailable.",
@@ -656,11 +687,16 @@ impl GatewayRouter {
             bindings.remove(session_key);
             return None;
         }
-        let profile = profiles.get(&binding.workspace_id)?;
+        let Some(profile) = profiles.get(&binding.workspace_id) else {
+            bindings.remove(session_key);
+            self.remove_aliases_for(session_key);
+            return None;
+        };
         if binding_fingerprint(&host, profile) != binding.fingerprint
             || !PathBuf::from(&profile.path).is_dir()
         {
             bindings.remove(session_key);
+            self.remove_aliases_for(session_key);
             return None;
         }
         binding.last_used = Instant::now();
@@ -675,7 +711,7 @@ impl GatewayRouter {
         host: &WorkspaceProfile,
         target: &WorkspaceProfile,
     ) -> Result<SharedState, Value> {
-        self.build_context_at_root(host, target, PathBuf::from(&target.path))
+        self.build_context_at_root(host, target, PathBuf::from(&target.path), None)
     }
 
     fn build_context_at_root(
@@ -683,20 +719,32 @@ impl GatewayRouter {
         host: &WorkspaceProfile,
         target: &WorkspaceProfile,
         root: PathBuf,
+        identity: Option<GitIdentity>,
     ) -> Result<SharedState, Value> {
-        let workspace = Workspace::new(root).map_err(|error| {
-            tool_err_code("workspace_unavailable", error.to_string(), "gateway")
-        })?;
+        let workspace =
+            Workspace::new_with_roots(PathBuf::from(&target.path), root).map_err(tool_err)?;
         let host_policy = PolicySettings::from_runtime(&host.runtime);
         let target_policy = PolicySettings::from_runtime(&target.runtime);
         let policy = intersect_policies(&host_policy, &target_policy);
-        Ok(Arc::new(ToolContext::from_workspace(
-            workspace,
-            host.auth.clone(),
-            policy.clone(),
-            target.runtime.tool_profile.clone(),
-            policy.permission_mode.clone(),
-        )))
+        let context = match identity {
+            Some(identity) => ToolContext::try_from_workspace_with_identity(
+                workspace,
+                host.auth.clone(),
+                policy.clone(),
+                target.runtime.tool_profile.clone(),
+                policy.permission_mode.clone(),
+                identity,
+            ),
+            None => ToolContext::try_from_workspace(
+                workspace,
+                host.auth.clone(),
+                policy.clone(),
+                target.runtime.tool_profile.clone(),
+                policy.permission_mode.clone(),
+            ),
+        }
+        .map_err(tool_err)?;
+        Ok(Arc::new(context))
     }
 
     fn binding_snapshot(
@@ -1476,6 +1524,31 @@ mod tests {
     }
 
     #[test]
+    fn removing_target_profile_clears_binding_for_reselection() {
+        let host_dir = tempfile::tempdir().expect("host");
+        let target_dir = tempfile::tempdir().expect("target");
+        let host = profile(
+            host_dir.path(),
+            "host",
+            true,
+            vec!["host".into(), "target".into()],
+        );
+        let target = profile(target_dir.path(), "target", false, vec![]);
+        let mut router = GatewayRouter::from_profiles(host, vec![target]);
+        assert_eq!(router.select_workspace("session", "target")["ok"], true);
+
+        let router_mut = Arc::get_mut(&mut router).expect("unique router");
+        let ProfileSource::Static(profiles) = &mut router_mut.source else {
+            panic!("expected static profiles");
+        };
+        profiles.remove("target");
+
+        let unavailable = router.selected_workspace("session");
+        assert_eq!(unavailable["error"]["code"], "workspace_not_selected");
+        assert_eq!(router.select_workspace("session", "host")["ok"], true);
+    }
+
+    #[test]
     fn openai_identity_precedes_transport_and_keeps_alias() {
         let workspace = tempfile::tempdir().expect("workspace");
         let host = profile(workspace.path(), "host", true, vec!["host".into()]);
@@ -1541,6 +1614,55 @@ mod tests {
             )
             .expect_err("conflicting aliases");
         assert_eq!(error["error"]["code"], "session_identity_conflict");
+    }
+
+    #[test]
+    fn new_openai_identity_wins_when_transport_alias_is_reused() {
+        let workspace = tempfile::tempdir().expect("workspace");
+        let host = profile(workspace.path(), "host", true, vec!["host".into()]);
+        let router = GatewayRouter::from_profiles(host, vec![]);
+
+        router
+            .resolve_session_identity(
+                SessionIdentifiers {
+                    openai: Some("conversation-a".into()),
+                    transport: Some("reused-transport".into()),
+                },
+                true,
+            )
+            .expect("first identity");
+        let second = router
+            .resolve_session_identity(
+                SessionIdentifiers {
+                    openai: Some("conversation-b".into()),
+                    transport: Some("reused-transport".into()),
+                },
+                true,
+            )
+            .expect("new OpenAI identity should win");
+        assert_eq!(second.key, "conversation-b");
+
+        let stale_pair = router
+            .resolve_session_identity(
+                SessionIdentifiers {
+                    openai: Some("conversation-a".into()),
+                    transport: Some("reused-transport".into()),
+                },
+                false,
+            )
+            .expect_err("stale transport pair must be rejected");
+        assert_eq!(stale_pair["error"]["code"], "session_identity_conflict");
+
+        let transport_only = router
+            .resolve_session_identity(
+                SessionIdentifiers {
+                    openai: None,
+                    transport: Some("reused-transport".into()),
+                },
+                false,
+            )
+            .expect("transport alias should follow the new conversation");
+        assert_eq!(transport_only.key, "conversation-b");
     }
 
     #[test]
@@ -1652,6 +1774,21 @@ mod tests {
             active.workspace.root().canonicalize().expect("active root"),
             worktree.canonicalize().expect("worktree root")
         );
+        assert_eq!(
+            active
+                .workspace
+                .repository_root()
+                .canonicalize()
+                .expect("repository root"),
+            configured.path().canonicalize().expect("configured root")
+        );
+        assert_eq!(
+            active
+                .execution_root()
+                .canonicalize()
+                .expect("execution root"),
+            worktree.canonicalize().expect("worktree root")
+        );
 
         let host_context = Arc::new(
             ToolContext::for_test(
@@ -1701,6 +1838,89 @@ mod tests {
                 .expect("restored root"),
             configured.path().canonicalize().expect("configured root")
         );
+    }
+
+    #[test]
+    fn pinned_context_routes_history_to_active_worktree_when_workspace_root_is_repository() {
+        let (configured, _main, worktree) = repository();
+        let host = profile(configured.path(), "host", true, vec!["host".into()]);
+        let router = GatewayRouter::from_profiles(host, vec![]);
+        assert_eq!(router.select_workspace("session", "host")["ok"], true);
+
+        let pinned = router.tool_result(
+            "session",
+            "pin_workspace_context",
+            &json!({
+                "path": worktree,
+                "expected_branch": "feature/context-lock",
+                "expires_in_minutes": 5
+            }),
+        );
+        assert_eq!(pinned["ok"], true);
+
+        let host_context = Arc::new(
+            ToolContext::for_test(
+                configured.path().to_path_buf(),
+                configured.path().join("harness"),
+            )
+            .expect("host context"),
+        );
+        let response = handle_gateway_request(
+            &router,
+            &host_context,
+            &json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "tools/call",
+                "params": {
+                    "name": "history_session_bootstrap",
+                    "arguments": {
+                        "workspace_root": configured.path(),
+                        "initial_user_input": "bootstrap pinned worktree history"
+                    }
+                }
+            }),
+            Some("session"),
+        );
+        let structured = &response["result"]["structuredContent"];
+        assert_eq!(structured["ok"], true);
+        assert_eq!(structured["current_path"], "docs/history-session/1.md");
+        assert!(worktree.join("docs/history-session/1.md").is_file());
+        assert!(!configured.path().join("docs/history-session/1.md").exists());
+    }
+
+    #[test]
+    fn get_workspace_context_returns_failure_when_pin_has_expired() {
+        let (configured, _main, worktree) = repository();
+        let host = profile(configured.path(), "host", true, vec!["host".into()]);
+        let router = GatewayRouter::from_profiles(host, vec![]);
+        assert_eq!(router.select_workspace("session", "host")["ok"], true);
+        let pinned = router.tool_result(
+            "session",
+            "pin_workspace_context",
+            &json!({
+                "path": worktree,
+                "expected_branch": "feature/context-lock",
+                "expires_in_minutes": 5
+            }),
+        );
+        assert_eq!(pinned["ok"], true);
+
+        let context_lock = router
+            .bindings
+            .lock()
+            .expect("gateway binding lock")
+            .get("session")
+            .and_then(|binding| binding.context_lock.clone())
+            .expect("pinned context lock");
+        context_lock
+            .lock()
+            .expect("workspace context lock")
+            .expire_for_test();
+
+        let result = router.tool_result("session", "get_workspace_context", &json!({}));
+        assert_eq!(result["ok"], false);
+        assert_eq!(result["error"]["code"], "WORKSPACE_CONTEXT_EXPIRED");
     }
 
     #[test]

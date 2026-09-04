@@ -106,13 +106,14 @@ pub(crate) async fn download_cloudflared_to_cache() -> AppResult<PathBuf> {
     let url = format!(
         "https://github.com/cloudflare/cloudflared/releases/download/{CLOUDFLARED_VERSION}/{asset}"
     );
-    let dest = cached_cloudflared_path()
-        .ok_or_else(|| AppError::Message("无法解析缓存目录。".into()))?;
+    let dest =
+        cached_cloudflared_path().ok_or_else(|| AppError::Message("无法解析缓存目录。".into()))?;
     if let Some(parent) = dest.parent() {
         std::fs::create_dir_all(parent)?;
     }
 
-    let bytes = crate::tunnel::download::download_release_asset(&settings, &url, "cloudflared").await?;
+    let bytes =
+        crate::tunnel::download::download_release_asset(&settings, &url, "cloudflared").await?;
 
     if asset.ends_with(".tgz") {
         extract_cloudflared_from_tar_gz(&bytes, &dest)?;
@@ -145,8 +146,8 @@ fn extract_cloudflared_from_tar_gz(bytes: &[u8], dest: &Path) -> AppResult<()> {
         .entries()
         .map_err(|err| AppError::Message(format!("解压 cloudflared 安装包失败: {err}")))?
     {
-        let mut entry =
-            entry.map_err(|err| AppError::Message(format!("读取 cloudflared 安装包失败: {err}")))?;
+        let mut entry = entry
+            .map_err(|err| AppError::Message(format!("读取 cloudflared 安装包失败: {err}")))?;
         let path = entry
             .path()
             .map_err(|err| AppError::Message(err.to_string()))?
@@ -184,11 +185,7 @@ pub fn extract_trycloudflare_url(line: &str) -> Option<String> {
         };
         let end = start + suffix_rel + SUFFIX.len();
         let host = &line[start + PREFIX.len()..end - SUFFIX.len()];
-        if host
-            .chars()
-            .all(|c| c.is_ascii_alphanumeric() || c == '-')
-            && !host.is_empty()
-        {
+        if host.chars().all(|c| c.is_ascii_alphanumeric() || c == '-') && !host.is_empty() {
             return Some(line[start..end].trim_end_matches('/').to_string());
         }
         search_from = start + PREFIX.len();
@@ -302,18 +299,9 @@ pub async fn spawn_cloudflare_tunnel(
     }
 
     if quick {
-        cmd.args([
-            "tunnel",
-            "--url",
-            &format!("http://127.0.0.1:{port}"),
-        ]);
+        cmd.args(["tunnel", "--url", &format!("http://127.0.0.1:{port}")]);
     } else {
-        cmd.args([
-            "tunnel",
-            "run",
-            "--token",
-            normalized_token,
-        ]);
+        cmd.args(["tunnel", "run", "--token", normalized_token]);
     }
 
     let mut child = cmd

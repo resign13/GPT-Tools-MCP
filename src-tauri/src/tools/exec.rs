@@ -1,4 +1,4 @@
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 #[cfg(windows)]
@@ -14,6 +14,7 @@ use crate::tools::session::{ExecSession, SessionStore};
 use crate::tools::workspace::{tool_ok, WorkspaceError};
 
 pub fn exec_command(ctx: &ToolContext, args: &Value) -> Result<Value, WorkspaceError> {
+    ctx.validate_execution_context()?;
     let cmd = args
         .get("cmd")
         .and_then(Value::as_str)
@@ -23,7 +24,7 @@ pub fn exec_command(ctx: &ToolContext, args: &Value) -> Result<Value, WorkspaceE
         .or_else(|| args.get("cwd"))
         .and_then(Value::as_str)
         .unwrap_or(".");
-    let workdir = ctx.workspace.resolve_existing(workdir_raw)?;
+    let workdir = ctx.resolve_command_cwd(workdir_raw)?;
     if !workdir.path.is_dir() {
         return Err(WorkspaceError::not_a_directory(
             "workdir is not a directory",
@@ -45,7 +46,7 @@ pub fn exec_command(ctx: &ToolContext, args: &Value) -> Result<Value, WorkspaceE
             object.insert("sandbox_enforced".into(), Value::Bool(false));
             object.insert(
                 "execution_boundary".into(),
-                Value::String("policy_only".into()),
+                Value::String("native_builtin".into()),
             );
             object.insert("child_process".into(), Value::Bool(false));
             object.insert("transport_ok".into(), Value::Bool(true));
@@ -53,6 +54,9 @@ pub fn exec_command(ctx: &ToolContext, args: &Value) -> Result<Value, WorkspaceE
         }
         return Ok(tool_ok(result));
     }
+    // A Git workspace must never fall back to direct child-process execution.
+    // The platform manager will allow this only after an enforced sandbox exists.
+    ctx.require_exec_sandbox()?;
     let timeout_ms = args
         .get("timeout_ms")
         .and_then(Value::as_u64)
@@ -86,12 +90,25 @@ pub fn exec_command(ctx: &ToolContext, args: &Value) -> Result<Value, WorkspaceE
     match result {
         Ok(mut out) => {
             if let Some(object) = out.as_object_mut() {
+                let sandbox_enforced = object
+                    .get("sandbox_enforced")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false);
                 object.insert("filesystem_scope".into(), Value::String(filesystem_scope));
-                object.insert("sandbox_enforced".into(), Value::Bool(false));
-                object.insert(
-                    "execution_boundary".into(),
-                    Value::String("policy_only".into()),
-                );
+                object.insert("sandbox_enforced".into(), Value::Bool(sandbox_enforced));
+                if object.get("execution_boundary").is_none() {
+                    object.insert(
+                        "execution_boundary".into(),
+                        Value::String(
+                            if sandbox_enforced {
+                                "windows_appcontainer"
+                            } else {
+                                "policy_only"
+                            }
+                            .into(),
+                        ),
+                    );
+                }
                 object.insert("child_process".into(), Value::Bool(true));
             }
             Ok(tool_ok(out))
@@ -186,7 +203,7 @@ fn list_directory(
 ) -> Result<String, WorkspaceError> {
     let target = match args {
         [] => cwd.to_path_buf(),
-        [path] => ctx.workspace.resolve_existing(path)?.path,
+        [path] => ctx.resolve_command_path(cwd, path)?.path,
         _ => {
             return Err(WorkspaceError::invalid_argument(
                 "ls/dir accepts at most one directory path",
@@ -222,21 +239,173 @@ fn list_directory(
     })
 }
 
-#[allow(clippy::too_many_arguments)]
-async fn run_command(
+async fn spawn_session(
     ctx: &ToolContext,
-    cmd: &str,
+    program: &str,
+    args: &[String],
     cwd: &Path,
-    limit: Duration,
-    yield_time: Duration,
-    max_output: usize,
-    tty: bool,
-    stdin_text: &str,
-) -> Result<Value, WorkspaceError> {
-    let (program, args) = parse_and_resolve(cmd, cwd, ctx.workspace.root(), &ctx.policy)?;
-    let start = Instant::now();
+    interactive: bool,
+) -> Result<std::sync::Arc<ExecSession>, WorkspaceError> {
+    #[cfg(windows)]
+    if ctx.requires_strict_exec_isolation() {
+        let git_program = is_git_program(program);
+        let (mut sandbox_program, sandbox_args) = if git_program {
+            // A Git `cmd\git.exe` shim starts another process and loads the
+            // MinGW runtime through the host PATH.  Keep the sandbox launch
+            // single-process; `stage_git_runtime` supplies the private binary.
+            (program.to_string(), args.to_vec())
+        } else {
+            sandbox_invocation(program, args)
+        };
+        let mut readonly_roots = if git_program {
+            Vec::new()
+        } else {
+            toolchain_roots(&sandbox_program)
+        };
+        if !git_program && sandbox_program != program {
+            readonly_roots.extend(toolchain_roots(program));
+        }
+        let git_identity = git_program.then(|| ctx.git_identity()).flatten();
+        if let Some(identity) = git_identity.as_ref() {
+            // A linked worktree keeps its Git metadata in the repository's
+            // common `.git` directory, which is outside the execution root.
+            // Grant only those metadata roots read/execute access; the
+            // worktree itself remains the only writable root.
+            readonly_roots.push(identity.git_dir.clone());
+            readonly_roots.push(identity.git_common_dir.clone());
+            // Git's built-in commands may dispatch a helper from the
+            // installation's libexec tree.  Keep that tree read-only; the
+            // executable and its loader DLLs are staged into the sandbox.
+            readonly_roots.extend(git_runtime_roots(program));
+        }
+        readonly_roots.sort_by(|left, right| left.to_string_lossy().cmp(&right.to_string_lossy()));
+        readonly_roots.dedup();
+        let mut policy = ctx.sandbox_policy(cwd.to_path_buf(), readonly_roots);
+        if git_program {
+            if git_identity.is_none() {
+                return Err(WorkspaceError::ToolDetails {
+                    code: "WORKSPACE_CONTEXT_MISMATCH",
+                    message: "Git command has no validated worktree identity.".into(),
+                    category: "security",
+                    retryable: false,
+                    details: json!({"stage": "exec_preflight", "reason": "git_identity_missing"}),
+                });
+            }
+            sandbox_program = stage_git_runtime(program, &policy.temp_root)?;
+            // Git for Windows probes the process cwd before honoring GIT_DIR.
+            // A user-profile temp path can require traverse permissions on
+            // several protected ancestors inside an AppContainer.  Start in
+            // the system temp directory (which is already AppContainer-readable)
+            // and use the explicit Git variables below to pin repository
+            // operations to the validated execution worktree.
+            let system_temp = std::env::var_os("SystemRoot")
+                .map(PathBuf::from)
+                .map(|root| root.join("Temp"))
+                .filter(|path| path.is_dir());
+            policy.startup_directory = system_temp.unwrap_or_else(|| policy.temp_root.clone());
+        }
+        let temp = policy.temp_root.to_string_lossy().into_owned();
+        let git_config = format!("{temp}\\gitconfig");
+        let mut env = vec![
+            ("TMP".into(), temp.clone()),
+            ("TEMP".into(), temp),
+            // Keep user-home based tool configuration inside the explicitly
+            // granted sandbox temp directory. In particular, Git otherwise
+            // probes an inaccessible `/dev/null` global config path from its
+            // MSYS runtime when running as an AppContainer.
+            (
+                "HOME".into(),
+                policy.temp_root.to_string_lossy().into_owned(),
+            ),
+            (
+                "USERPROFILE".into(),
+                policy.temp_root.to_string_lossy().into_owned(),
+            ),
+            ("GIT_CONFIG_NOSYSTEM".into(), "1".into()),
+            ("GIT_CONFIG_SYSTEM".into(), git_config.clone()),
+            ("GIT_CONFIG_GLOBAL".into(), git_config),
+            ("PYTHONUTF8".into(), "1".into()),
+            ("PYTHONIOENCODING".into(), "utf-8".into()),
+            ("PYTHONLEGACYWINDOWSSTDIO".into(), "0".into()),
+        ];
+        if git_program {
+            let temp_root = policy.temp_root.clone();
+            env.extend([
+                (
+                    "GIT_DIR".into(),
+                    platform_command_path(&ctx.execution_root().join(".git"))
+                        .to_string_lossy()
+                        .into_owned(),
+                ),
+                (
+                    "GIT_WORK_TREE".into(),
+                    platform_command_path(&ctx.execution_root())
+                        .to_string_lossy()
+                        .into_owned(),
+                ),
+                (
+                    "GIT_CEILING_DIRECTORIES".into(),
+                    platform_command_path(&temp_root)
+                        .to_string_lossy()
+                        .into_owned(),
+                ),
+            ]);
+            let install_root = git_install_root(program).ok_or_else(|| {
+                git_runtime_staging_error(
+                    "Git installation root could not be resolved.",
+                    json!({"stage": "exec_preflight", "reason": "git_install_root_missing"}),
+                )
+            })?;
+            let source_bin = install_root.join("mingw64").join("bin");
+            let source_core = install_root
+                .join("mingw64")
+                .join("libexec")
+                .join("git-core");
+            let source_usr_bin = install_root.join("usr").join("bin");
+            let staged_bin = Path::new(&sandbox_program)
+                .parent()
+                .unwrap_or_else(|| Path::new("."));
+            let mut path_parts = vec![
+                staged_bin.to_string_lossy().into_owned(),
+                source_core.to_string_lossy().into_owned(),
+                source_bin.to_string_lossy().into_owned(),
+                source_usr_bin.to_string_lossy().into_owned(),
+            ];
+            if let Some(system_root) = std::env::var_os("SystemRoot") {
+                path_parts.push(
+                    PathBuf::from(system_root)
+                        .join("System32")
+                        .to_string_lossy()
+                        .into_owned(),
+                );
+            }
+            env.push((
+                "GIT_EXEC_PATH".into(),
+                source_core.to_string_lossy().into_owned(),
+            ));
+            let templates = install_root
+                .join("mingw64")
+                .join("share")
+                .join("git-core")
+                .join("templates");
+            if templates.is_dir() {
+                env.push((
+                    "GIT_TEMPLATE_DIR".into(),
+                    templates.to_string_lossy().into_owned(),
+                ));
+            }
+            env.push(("PATH".into(), path_parts.join(";")));
+        }
+        let child = ctx.spawn_sandbox(&policy, &sandbox_program, &sandbox_args, &env)?;
+        let session = ctx.sessions.insert(ExecSession::new_with_sandbox_child(
+            child,
+            interactive,
+            ctx.execution_fingerprint(),
+        ));
+        return Ok(session);
+    }
 
-    let mut command = command_for_program(&program, &args);
+    let mut command = command_for_program(program, args);
     command
         .current_dir(platform_command_path(cwd))
         .stdin(std::process::Stdio::piped())
@@ -261,7 +430,274 @@ async fn run_command(
         }),
     })?;
 
-    let session = ctx.sessions.insert(ExecSession::new_with_mode(child, tty));
+    Ok(ctx
+        .sessions
+        .insert(ExecSession::new_with_mode_and_fingerprint(
+            child,
+            interactive,
+            ctx.execution_fingerprint(),
+        )))
+}
+
+#[cfg(windows)]
+fn is_git_program(program: &str) -> bool {
+    Path::new(program)
+        .file_stem()
+        .and_then(|value| value.to_str())
+        .is_some_and(|value| value.eq_ignore_ascii_case("git"))
+}
+
+#[cfg(windows)]
+fn sandbox_invocation(program: &str, args: &[String]) -> (String, Vec<String>) {
+    if is_git_program(program) {
+        return (program.to_string(), args.to_vec());
+    }
+    let extension = Path::new(program)
+        .extension()
+        .and_then(|value| value.to_str())
+        .map(str::to_ascii_lowercase);
+    match extension.as_deref() {
+        Some("bat") | Some("cmd") => {
+            let shell = which::which("cmd.exe")
+                .unwrap_or_else(|_| Path::new("C:\\Windows\\System32\\cmd.exe").to_path_buf());
+            (
+                shell.to_string_lossy().into_owned(),
+                vec![
+                    "/d".into(),
+                    "/s".into(),
+                    "/c".into(),
+                    windows_batch_command_line(program, args),
+                ],
+            )
+        }
+        Some("ps1") => {
+            let shell = which::which("pwsh")
+                .or_else(|_| which::which("powershell"))
+                .unwrap_or_else(|_| {
+                    Path::new("C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe")
+                        .to_path_buf()
+                });
+            let mut invocation = vec![
+                "-NoLogo".into(),
+                "-NoProfile".into(),
+                "-NonInteractive".into(),
+                "-ExecutionPolicy".into(),
+                "Bypass".into(),
+                "-File".into(),
+                windows_command_path(program),
+            ];
+            invocation.extend(args.iter().cloned());
+            (shell.to_string_lossy().into_owned(), invocation)
+        }
+        _ => (program.to_string(), args.to_vec()),
+    }
+}
+
+#[cfg(windows)]
+fn toolchain_roots(program: &str) -> Vec<std::path::PathBuf> {
+    let path = Path::new(program);
+    let Some(parent) = path.parent() else {
+        return Vec::new();
+    };
+    let mut roots = vec![parent.to_path_buf()];
+    if let Some(grandparent) = parent.parent() {
+        if grandparent != Path::new("\\") && grandparent.components().count() > 1 {
+            roots.push(grandparent.to_path_buf());
+        }
+    }
+    roots
+}
+
+#[cfg(windows)]
+fn git_runtime_roots(program: &str) -> Vec<std::path::PathBuf> {
+    let Some(install_root) = git_install_root(program) else {
+        return Vec::new();
+    };
+    [
+        install_root.join("mingw64").join("bin"),
+        install_root.join("usr").join("bin"),
+        install_root.join("mingw64").join("libexec"),
+        install_root
+            .join("mingw64")
+            .join("libexec")
+            .join("git-core"),
+        install_root.join("libexec").join("git-core"),
+    ]
+    .into_iter()
+    .filter(|root| root.is_dir())
+    .collect()
+}
+
+#[cfg(windows)]
+fn git_install_root(program: impl AsRef<Path>) -> Option<std::path::PathBuf> {
+    let path = program.as_ref();
+    let parent = path.parent()?;
+    if path_component_is(parent, "cmd") {
+        return parent.parent().map(Path::to_path_buf);
+    }
+    if path_component_is(parent, "bin")
+        && parent
+            .parent()
+            .is_some_and(|value| path_component_is(value, "mingw64"))
+    {
+        return parent
+            .parent()
+            .and_then(Path::parent)
+            .map(Path::to_path_buf);
+    }
+    None
+}
+
+#[cfg(windows)]
+fn path_component_is(path: &Path, expected: &str) -> bool {
+    path.file_name()
+        .and_then(|value| value.to_str())
+        .is_some_and(|value| value.eq_ignore_ascii_case(expected))
+}
+
+#[cfg(windows)]
+fn git_runtime_staging_error(message: impl Into<String>, details: Value) -> WorkspaceError {
+    WorkspaceError::ToolDetails {
+        code: "GIT_RUNTIME_STAGING_FAILED",
+        message: message.into(),
+        category: "security",
+        retryable: true,
+        details,
+    }
+}
+
+#[cfg(windows)]
+fn stage_git_runtime(program: &str, temp_root: &Path) -> Result<String, WorkspaceError> {
+    use std::fs;
+    use std::sync::{Mutex, OnceLock};
+
+    static STAGE_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+    let _guard = STAGE_LOCK
+        .get_or_init(|| Mutex::new(()))
+        .lock()
+        .map_err(|_| {
+            git_runtime_staging_error(
+                "Git runtime staging lock was poisoned.",
+                json!({"stage": "lock", "reason": "lock_poisoned"}),
+            )
+        })?;
+
+    let program_path = fs::canonicalize(program).map_err(|error| {
+        git_runtime_staging_error(
+            format!("Git executable is unavailable: {error}"),
+            json!({"stage": "source", "program": program}),
+        )
+    })?;
+    let install_root = git_install_root(&program_path).ok_or_else(|| {
+        git_runtime_staging_error(
+            "Git installation root could not be inferred from the executable path.",
+            json!({"stage": "source", "program": program_path}),
+        )
+    })?;
+    let source_bin = install_root.join("mingw64").join("bin");
+    let source_git = source_bin.join("git.exe");
+    if !source_git.is_file() {
+        return Err(git_runtime_staging_error(
+            "Git for Windows MinGW executable was not found.",
+            json!({"stage": "source", "git": source_git}),
+        ));
+    }
+    let source_git = fs::canonicalize(&source_git).map_err(|error| {
+        git_runtime_staging_error(
+            format!("Git runtime path could not be resolved: {error}"),
+            json!({"stage": "source", "git": source_git}),
+        )
+    })?;
+
+    fs::create_dir_all(temp_root).map_err(|error| {
+        git_runtime_staging_error(
+            format!("Sandbox temporary directory could not be created: {error}"),
+            json!({"stage": "destination", "temp_root": temp_root}),
+        )
+    })?;
+    let runtime_root = temp_root.join("git-runtime");
+    let staged_bin = runtime_root.join("mingw64").join("bin");
+    let staged_git = staged_bin.join("git.exe");
+    let marker = runtime_root.join(".source");
+    let source_key = source_git.to_string_lossy().into_owned();
+
+    if staged_git.is_file()
+        && fs::read_to_string(&marker)
+            .map(|value| value.trim() == source_key)
+            .unwrap_or(false)
+    {
+        return Ok(staged_git.to_string_lossy().into_owned());
+    }
+    if runtime_root.exists() {
+        fs::remove_dir_all(&runtime_root).map_err(|error| {
+            git_runtime_staging_error(
+                format!("Incomplete staged Git runtime could not be replaced: {error}"),
+                json!({"stage": "destination", "runtime_root": runtime_root}),
+            )
+        })?;
+    }
+    fs::create_dir_all(&staged_bin).map_err(|error| {
+        git_runtime_staging_error(
+            format!("Staged Git runtime directory could not be created: {error}"),
+            json!({"stage": "destination", "runtime_root": runtime_root}),
+        )
+    })?;
+    fs::copy(&source_git, &staged_git).map_err(|error| {
+        git_runtime_staging_error(
+            format!("Git executable could not be staged: {error}"),
+            json!({"stage": "copy", "source": source_git, "destination": staged_git}),
+        )
+    })?;
+
+    // `git.exe` has a small, stable MinGW loader dependency set.  Keep the
+    // staged runtime private instead of granting the AppContainer access to
+    // the complete Git installation tree.
+    for dependency in [
+        "libiconv-2.dll",
+        "libintl-8.dll",
+        "libpcre2-8-0.dll",
+        "libwinpthread-1.dll",
+        "zlib1.dll",
+    ] {
+        let source = source_bin.join(dependency);
+        let destination = staged_bin.join(dependency);
+        if !source.is_file() {
+            return Err(git_runtime_staging_error(
+                format!("Git runtime dependency is missing: {dependency}"),
+                json!({"stage": "dependency", "source": source}),
+            ));
+        }
+        fs::copy(&source, &destination).map_err(|error| {
+            git_runtime_staging_error(
+                format!("Git runtime dependency could not be staged: {error}"),
+                json!({"stage": "dependency", "source": source, "destination": destination}),
+            )
+        })?;
+    }
+
+    fs::write(&marker, source_key).map_err(|error| {
+        git_runtime_staging_error(
+            format!("Staged Git runtime marker could not be written: {error}"),
+            json!({"stage": "destination", "marker": marker}),
+        )
+    })?;
+    Ok(staged_git.to_string_lossy().into_owned())
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn run_command(
+    ctx: &ToolContext,
+    cmd: &str,
+    cwd: &Path,
+    limit: Duration,
+    yield_time: Duration,
+    max_output: usize,
+    tty: bool,
+    stdin_text: &str,
+) -> Result<Value, WorkspaceError> {
+    let (program, args) = parse_and_resolve(cmd, cwd, ctx, &ctx.policy)?;
+    let start = Instant::now();
+    let session = spawn_session(ctx, &program, &args, cwd, tty).await?;
     session.spawn_readers().await;
     let deadline = start + limit;
 
@@ -361,12 +797,34 @@ fn schedule_session_eviction(sessions: Arc<SessionStore>, session_id: String) {
 }
 
 pub fn exec_health_check(ctx: &ToolContext) -> Result<Value, WorkspaceError> {
+    ctx.validate_execution_context()?;
     let start = Instant::now();
-    let cwd = ctx.workspace.root().to_path_buf();
+    let cwd = ctx.execution_root();
     #[cfg(windows)]
     let probe = r#"cmd.exe /d /c "echo exec-health && echo exec-health-stderr 1>&2""#;
     #[cfg(not(windows))]
     let probe = r#"sh -c "printf exec-health; printf exec-health-stderr >&2""#;
+
+    let mut response = json!({
+        "worker": {"alive": true},
+        "session_create": false,
+        "command_run": false,
+        "stdout_capture": false,
+        "stderr_capture": false,
+        "duration_ms": start.elapsed().as_millis(),
+        "next_actions": []
+    });
+
+    if let Err(error) = ctx.require_exec_sandbox() {
+        response["status"] = Value::String("error".into());
+        response["summary"] = Value::String(
+            "exec health check 未执行：strict workspace isolation 尚未具备 OS sandbox".into(),
+        );
+        response["error"] = error.to_error_value();
+        response["next_actions"] = json!(["启用 Windows AppContainer sandbox 后重试"]);
+        response["duration_ms"] = json!(start.elapsed().as_millis());
+        return Ok(tool_ok(response));
+    }
 
     let result = tauri::async_runtime::block_on(run_command(
         ctx,
@@ -378,16 +836,6 @@ pub fn exec_health_check(ctx: &ToolContext) -> Result<Value, WorkspaceError> {
         false,
         "",
     ));
-
-    let mut response = json!({
-        "worker": {"alive": true},
-        "session_create": false,
-        "command_run": false,
-        "stdout_capture": false,
-        "stderr_capture": false,
-        "duration_ms": start.elapsed().as_millis(),
-        "next_actions": []
-    });
 
     match result {
         Ok(snapshot) => {
@@ -457,12 +905,34 @@ fn execution_failure_result(error: &WorkspaceError, command: &str, cwd: &Path) -
         })
     });
     if let Some(object) = result.as_object_mut() {
+        let sandbox_enforced = object
+            .get("sandbox_enforced")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        let execution_boundary = object
+            .get("execution_boundary")
+            .and_then(Value::as_str)
+            .map(str::to_owned)
+            .unwrap_or_else(|| {
+                if sandbox_enforced {
+                    "windows_appcontainer".into()
+                } else {
+                    "policy_only".into()
+                }
+            });
         object.insert("command".into(), json!(command));
         object.insert("resolved_cwd".into(), json!(cwd.display().to_string()));
-        object.insert("execution_mode".into(), json!("direct"));
+        object.insert(
+            "execution_mode".into(),
+            json!(if sandbox_enforced {
+                "sandbox"
+            } else {
+                "direct"
+            }),
+        );
         object.insert("filesystem_scope".into(), json!("workspace"));
-        object.insert("sandbox_enforced".into(), Value::Bool(false));
-        object.insert("execution_boundary".into(), json!("policy_only"));
+        object.insert("sandbox_enforced".into(), Value::Bool(sandbox_enforced));
+        object.insert("execution_boundary".into(), json!(execution_boundary));
         object.insert("child_process".into(), Value::Bool(true));
         object.insert("transport_ok".into(), Value::Bool(true));
         object.insert("command_ok".into(), Value::Bool(false));
@@ -508,11 +978,34 @@ fn merge_exec_result(
             "command_ok".into(),
             command_ok.map(Value::Bool).unwrap_or(Value::Null),
         );
-        obj.insert("execution_mode".into(), json!("direct"));
+        let sandbox_enforced = obj
+            .get("sandbox_enforced")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        obj.insert(
+            "execution_mode".into(),
+            json!(if sandbox_enforced {
+                "sandbox"
+            } else {
+                "direct"
+            }),
+        );
+        if obj.get("execution_boundary").is_none() {
+            obj.insert(
+                "execution_boundary".into(),
+                json!(if sandbox_enforced {
+                    "windows_appcontainer"
+                } else {
+                    "policy_only"
+                }),
+            );
+        }
         obj.insert(
             "warnings".into(),
             json!(if keep_session {
                 vec!["session retained for read_output/write_stdin/kill_session"]
+            } else if sandbox_enforced {
+                vec!["sandboxed execution without shell"]
             } else {
                 vec!["direct execution without shell"]
             }),
@@ -524,7 +1017,7 @@ fn merge_exec_result(
 fn parse_and_resolve(
     cmd: &str,
     cwd: &Path,
-    workspace_root: &Path,
+    ctx: &ToolContext,
     policy: &crate::tools::policy::PolicySettings,
 ) -> Result<(String, Vec<String>), WorkspaceError> {
     let parts = shell_words::split(cmd)
@@ -533,14 +1026,14 @@ fn parse_and_resolve(
         return Err(WorkspaceError::invalid_argument("Empty command"));
     }
 
-    let program = resolve_program(&parts[0], cwd, workspace_root, policy)?;
+    let program = resolve_program(&parts[0], cwd, ctx, policy)?;
     Ok((program, parts[1..].to_vec()))
 }
 
 fn resolve_program(
     raw: &str,
     cwd: &Path,
-    workspace_root: &Path,
+    ctx: &ToolContext,
     policy: &crate::tools::policy::PolicySettings,
 ) -> Result<String, WorkspaceError> {
     let trimmed = raw.trim();
@@ -561,23 +1054,13 @@ fn resolve_program(
             category: "runtime",
             retryable: false,
         })?;
-        let canonical_workspace =
-            workspace_root
-                .canonicalize()
-                .map_err(|_| WorkspaceError::Tool {
-                    code: "COMMAND_REJECTED",
-                    message: "Workspace root is unavailable".into(),
-                    category: "runtime",
-                    retryable: true,
-                })?;
-        if !resolved.starts_with(&canonical_workspace) {
-            return Err(WorkspaceError::Tool {
+        ctx.validate_path(&resolved, crate::tools::PathIntent::CommandCwd)
+            .map_err(|_| WorkspaceError::Tool {
                 code: "EXECUTABLE_OUTSIDE_WORKSPACE",
                 message: format!("Workspace 外可执行文件被拒绝: {trimmed}"),
                 category: "security",
                 retryable: false,
-            });
-        }
+            })?;
         let extension = resolved
             .extension()
             .and_then(|value| value.to_str())
@@ -663,13 +1146,17 @@ mod tests {
     #[test]
     fn resolves_an_arbitrarily_named_workspace_local_entry() {
         let workspace = tempdir().expect("workspace");
+        let harness = tempdir().expect("harness");
         let entry = workspace.path().join("scripts").join("anything.cmd");
         std::fs::create_dir_all(entry.parent().expect("parent")).expect("scripts");
         std::fs::write(&entry, "echo test").expect("entry");
+        let context =
+            ToolContext::for_test(workspace.path().to_path_buf(), harness.path().to_path_buf())
+                .expect("context");
         let resolved = resolve_program(
             "scripts/anything.cmd",
             workspace.path(),
-            workspace.path(),
+            &context,
             &crate::tools::policy::PolicySettings::default(),
         )
         .expect("workspace entry resolves");
@@ -715,7 +1202,8 @@ mod tests {
         // Ensure console-subsystem programs (python.exe) also go through the
         // hidden-window flag path; Command does not expose creation_flags for
         // direct assertion, so this only verifies construction still succeeds.
-        let python = command_for_program("C:/Python312/python.exe", &["-c".into(), "print(1)".into()]);
+        let python =
+            command_for_program("C:/Python312/python.exe", &["-c".into(), "print(1)".into()]);
         assert_eq!(
             python.as_std().get_program().to_string_lossy(),
             "C:/Python312/python.exe"

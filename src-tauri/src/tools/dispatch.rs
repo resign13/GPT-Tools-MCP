@@ -1,5 +1,3 @@
-use std::path::Path;
-
 use serde_json::{json, Value};
 
 use crate::tools::context::ToolContext;
@@ -52,13 +50,16 @@ fn policy_tool_err(err: PolicyError) -> Value {
 /// **唯一工具执行入口**。MCP `tools/call` 与 Actions `POST /actions/{tool}` 必须且只能调用此函数。
 /// 策略校验、分发、错误格式在此统一，两路传输层不得另做执行前校验（Actions 仅允许额外的暴露层 `validate_actions_exposure`）。
 pub fn call_tool(ctx: &ToolContext, name: &str, args: &Value) -> Value {
-    let effective_args = apply_default_cwd(ctx, name, args);
-    if let Err(e) = validate_tool_arguments_for_workspace(
-        name,
-        &effective_args,
-        &ctx.policy,
-        Some(&ctx.workspace),
-    ) {
+    if let Err(error) = ctx.validate_execution_context() {
+        return tool_err(error);
+    }
+    // Keep the original arguments intact. Each tool resolves paths through the
+    // execution-aware context; policy inspection only needs an implicit command
+    // cwd when the caller omitted one.
+    let policy_args = policy_arguments(ctx, name, args);
+    if let Err(e) =
+        validate_tool_arguments_for_workspace(name, &policy_args, &ctx.policy, Some(&ctx.workspace))
+    {
         return policy_tool_err(e);
     }
 
@@ -69,7 +70,7 @@ pub fn call_tool(ctx: &ToolContext, name: &str, args: &Value) -> Value {
         };
     }
 
-    let task_id = if requires_write_baseline(name, &effective_args) {
+    let task_id = if requires_write_baseline(name, args) {
         let task = ctx.harness.current_task().ok().flatten();
         if let Some(task) = task {
             if let Err(error) = ctx.harness.check_baseline(&task.id) {
@@ -109,34 +110,33 @@ pub fn call_tool(ctx: &ToolContext, name: &str, args: &Value) -> Value {
         None
     };
 
-    let ws = &ctx.workspace;
     let result = match name {
-        "history_session_bootstrap" => history::bootstrap(ctx, &effective_args),
-        "history_session_checkpoint" => history::checkpoint(ctx, &effective_args),
-        "history_session_validate" => history::validate(ctx, &effective_args),
-        "history_session_search" => history::search(ctx, &effective_args),
-        "history_session_read" => history::read(ctx, &effective_args),
+        "history_session_bootstrap" => history::bootstrap(ctx, args),
+        "history_session_checkpoint" => history::checkpoint(ctx, args),
+        "history_session_validate" => history::validate(ctx, args),
+        "history_session_search" => history::search(ctx, args),
+        "history_session_read" => history::read(ctx, args),
         "server_info" => server_info(ctx),
         "check_exec_environment" => check_exec_environment(ctx),
         "exec_health_check" => exec::exec_health_check(ctx),
         "get_default_cwd" => get_default_cwd(ctx),
-        "set_default_cwd" => set_default_cwd(ctx, &effective_args),
-        "read_file" => file::read_file(ws, &effective_args),
-        "list_dir" => file::list_dir(ws, &effective_args),
-        "list_files" => file::list_files(ws, &effective_args),
-        "search_text" | "grep_text" | "grep" => file::search_text(ws, &effective_args),
-        "patch_check" => patch::patch_check(ctx, &effective_args),
-        "apply_patch" => patch::apply_patch(ctx, &effective_args),
-        "exec_command" => exec::exec_command(ctx, &effective_args),
-        "read_output" => session::read_output(&ctx.sessions, &effective_args),
-        "write_stdin" => session::write_stdin(&ctx.sessions, &effective_args),
-        "kill_session" => session::kill_session(&ctx.sessions, &effective_args),
-        "git_status" => git::git_status(ws, &effective_args),
-        "git_diff" => git::git_diff(ws, &effective_args),
-        "git_log" => git::git_log(ws, &effective_args),
-        "git_show" => git::git_show(ws, &effective_args),
-        "git_blame" => git::git_blame(ws, &effective_args),
-        "view_image" => image_tool::view_image(ws, &effective_args),
+        "set_default_cwd" => set_default_cwd(ctx, args),
+        "read_file" => file::read_file(ctx, args),
+        "list_dir" => file::list_dir(ctx, args),
+        "list_files" => file::list_files(ctx, args),
+        "search_text" | "grep_text" | "grep" => file::search_text(ctx, args),
+        "patch_check" => patch::patch_check(ctx, args),
+        "apply_patch" => patch::apply_patch(ctx, args),
+        "exec_command" => exec::exec_command(ctx, args),
+        "read_output" => session::read_output(ctx, args),
+        "write_stdin" => session::write_stdin(ctx, args),
+        "kill_session" => session::kill_session(ctx, args),
+        "git_status" => git::git_status(ctx, args),
+        "git_diff" => git::git_diff(ctx, args),
+        "git_log" => git::git_log(ctx, args),
+        "git_show" => git::git_show(ctx, args),
+        "git_blame" => git::git_blame(ctx, args),
+        "view_image" => image_tool::view_image(ctx, args),
         "request_permissions" => {
             if ctx.policy.skip_permission_gates() {
                 Ok(tool_ok(json!({
@@ -147,7 +147,7 @@ pub fn call_tool(ctx: &ToolContext, name: &str, args: &Value) -> Value {
                     "constraints": {
                         "mode": "dangerous",
                         "workspace": ctx.workspace.root_display(),
-                        "requested": effective_args
+                        "requested": args
                     },
                     "warnings": [
                         "dangerous permission mode is enabled; permission-gated operations are auto-granted"
@@ -165,7 +165,7 @@ pub fn call_tool(ctx: &ToolContext, name: &str, args: &Value) -> Value {
                         "message": "Permission elicitation is not available for this client.",
                         "category": "permission",
                         "retryable": false,
-                        "details": { "requested": effective_args }
+                        "details": { "requested": args }
                     }
                 })))
             }
@@ -230,80 +230,18 @@ pub fn call_tool(ctx: &ToolContext, name: &str, args: &Value) -> Value {
     output
 }
 
-fn apply_default_cwd(ctx: &ToolContext, name: &str, args: &Value) -> Value {
-    let base = if ctx.default_cwd_path() == ctx.workspace.root() {
+fn policy_arguments(ctx: &ToolContext, name: &str, args: &Value) -> Value {
+    if name != "exec_command" || args.get("workdir").is_some() || args.get("cwd").is_some() {
+        return args.clone();
+    }
+    let mut effective = args.clone();
+    let base = if ctx.default_cwd_path() == ctx.execution_root() {
         ".".to_string()
     } else {
         ctx.default_cwd_display()
     };
-    if base == "." {
-        return args.clone();
-    }
-
-    let mut effective = args.clone();
-    match name {
-        "exec_command" if effective.get("workdir").is_none() && effective.get("cwd").is_none() => {
-            effective["workdir"] = Value::String(base.clone());
-        }
-        "list_dir" | "list_files" | "git_status" | "git_log" => {
-            let path = effective.get("path").and_then(Value::as_str).unwrap_or(".");
-            effective["path"] = Value::String(prefix_relative_path(&base, path));
-        }
-        "read_file" | "search_text" | "grep_text" | "grep" | "git_blame" | "view_image" => {
-            if let Some(path) = effective.get("path").and_then(Value::as_str) {
-                effective["path"] = Value::String(prefix_relative_path(&base, path));
-            }
-        }
-        "git_diff" => {
-            if let Some(path) = effective.get("path").and_then(Value::as_str) {
-                effective["path"] = Value::String(prefix_relative_path(&base, path));
-            }
-            if let Some(paths) = effective.get("paths").and_then(Value::as_array).cloned() {
-                effective["paths"] = Value::Array(
-                    paths
-                        .iter()
-                        .map(|path| {
-                            path.as_str()
-                                .map(|value| Value::String(prefix_relative_path(&base, value)))
-                                .unwrap_or_else(|| path.clone())
-                        })
-                        .collect(),
-                );
-            }
-        }
-        "apply_patch" | "patch_check" => {
-            if let Some(patch) = effective.get("patch").and_then(Value::as_str) {
-                effective["patch"] = Value::String(prefix_patch_paths(&base, patch));
-            }
-        }
-        _ => {}
-    }
+    effective["workdir"] = Value::String(base);
     effective
-}
-
-fn prefix_relative_path(base: &str, path: &str) -> String {
-    if path == "." || path.is_empty() {
-        return base.to_string();
-    }
-    if Path::new(path).is_absolute() || path.starts_with("..") {
-        return path.to_string();
-    }
-    format!("{base}/{}", path.trim_start_matches("./"))
-}
-
-fn prefix_patch_paths(base: &str, patch: &str) -> String {
-    patch
-        .lines()
-        .map(|line| {
-            for marker in ["--- a/", "+++ b/"] {
-                if let Some(path) = line.strip_prefix(marker) {
-                    return format!("{marker}{base}/{path}");
-                }
-            }
-            line.to_string()
-        })
-        .collect::<Vec<_>>()
-        .join("\n")
 }
 
 fn requires_write_baseline(name: &str, args: &Value) -> bool {
@@ -385,15 +323,21 @@ fn filter_exposed_actions(ctx: &ToolContext, actions: Vec<String>) -> Vec<String
 
 pub fn server_info(ctx: &ToolContext) -> Result<Value, WorkspaceError> {
     let tools = crate::tools::registry::exposed_tool_names(&ctx.tool_profile);
+    let sandbox = ctx.exec_sandbox_status();
     Ok(tool_ok(json!({
         "server": "coding-tools-mcp",
         "title": "Coding Tools MCP",
         "version": env!("CARGO_PKG_VERSION"),
         "protocol_version": "2025-06-18",
         "workspace": ctx.workspace.root_display(),
+        "repository_root": ctx.repository_root_display(),
+        "execution_root": ctx.execution_root_display(),
         "permission_mode": ctx.permission_mode,
         "default_cwd": ctx.default_cwd_display(),
         "network_allowed": ctx.policy.network_allowed(),
+        "execution_isolation_mode": ctx.execution_isolation_mode().as_str(),
+        "workspace_exec_boundary": sandbox.boundary(),
+        "workspace_exec_sandbox_enforced": sandbox.enforced,
         "tool_profile": ctx.tool_profile,
         "auth_enabled": ctx.auth.auth_enabled(),
         "auth_type": ctx.auth.auth_type,
@@ -404,21 +348,33 @@ pub fn server_info(ctx: &ToolContext) -> Result<Value, WorkspaceError> {
 }
 
 pub fn check_exec_environment(ctx: &ToolContext) -> Result<Value, WorkspaceError> {
+    let sandbox = ctx.exec_sandbox_status();
+    let strict = ctx.requires_strict_exec_isolation();
+    let warnings = if strict {
+        vec!["Generic child processes are disabled until an OS filesystem sandbox is available"]
+    } else {
+        vec!["Workspace child processes use policy-only execution; no OS filesystem sandbox is enforced"]
+    };
     Ok(tool_ok(json!({
         "workspace": ctx.workspace.root_display(),
+        "repository_root": ctx.repository_root_display(),
+        "execution_root": ctx.execution_root_display(),
         "permission_mode": ctx.permission_mode,
         "network_allowed": ctx.policy.network_allowed(),
+        "execution_isolation_mode": ctx.execution_isolation_mode().as_str(),
         "landlock_enabled": false,
         "filesystem_sandbox": {
-            "available": false,
-            "enforced": false,
+            "available": sandbox.available,
+            "enforced": sandbox.enforced,
+            "implementation": sandbox.implementation,
+            "fallback_allowed": sandbox.fallback_allowed,
             "default_scope": "workspace",
             "host_scope_available": false
         },
         "global_tmp_write": if ctx.permission_mode == "dangerous" { "allowed" } else { "tmp-prefix" },
-        "workspace_exec_available": true,
-        "workspace_exec_sandbox_enforced": false,
-        "workspace_exec_boundary": "policy_only",
+        "workspace_exec_available": sandbox.available,
+        "workspace_exec_sandbox_enforced": sandbox.enforced,
+        "workspace_exec_boundary": sandbox.boundary(),
         "system_command_allowlist": ctx.policy.allowed_commands.iter().cloned().collect::<Vec<_>>(),
         "workspace_local_entries": {
             "enabled": ctx.policy.workspace_local_entries,
@@ -427,13 +383,14 @@ pub fn check_exec_environment(ctx: &ToolContext) -> Result<Value, WorkspaceError
         },
         // Backward-compatible alias for older MCP clients.
         "allowed_commands": ctx.policy.allowed_commands.iter().cloned().collect::<Vec<_>>(),
-        "warnings": ["Workspace 子进程当前允许执行，但尚未启用操作系统级文件系统沙箱"]
+        "warnings": warnings
     })))
 }
 
 pub fn get_default_cwd(ctx: &ToolContext) -> Result<Value, WorkspaceError> {
     Ok(tool_ok(json!({
         "workspace": ctx.workspace.root_display(),
+        "execution_root": ctx.execution_root_display(),
         "default_cwd": ctx.default_cwd_display(),
         "resolved_cwd": ctx.default_cwd_path().display().to_string()
     })))
@@ -441,15 +398,16 @@ pub fn get_default_cwd(ctx: &ToolContext) -> Result<Value, WorkspaceError> {
 
 pub fn set_default_cwd(ctx: &ToolContext, args: &Value) -> Result<Value, WorkspaceError> {
     let path = args.get("path").and_then(Value::as_str).unwrap_or(".");
-    let resolved = ctx.workspace.resolve_existing(path)?;
+    let resolved = ctx.resolve_from_execution_root(path, crate::tools::PathIntent::CommandCwd)?;
     if !resolved.path.is_dir() {
         return Err(WorkspaceError::not_a_directory(
             "Default cwd must be a directory",
         ));
     }
-    ctx.set_default_cwd(resolved.path.clone());
+    ctx.set_default_cwd(resolved.path.clone())?;
     Ok(tool_ok(json!({
         "workspace": ctx.workspace.root_display(),
+        "execution_root": ctx.execution_root_display(),
         "default_cwd": resolved.display,
         "resolved_cwd": resolved.path.display().to_string()
     })))

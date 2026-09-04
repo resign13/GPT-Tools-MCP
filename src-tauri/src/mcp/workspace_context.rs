@@ -1,14 +1,15 @@
-use std::io::Read;
 use std::path::{Path, PathBuf};
-use std::process::{Command, ExitStatus, Stdio};
-use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use serde_json::{json, Value};
 
+use crate::tools::execution_context::{
+    canonical_directory as execution_canonical_directory, is_ancestor as execution_is_ancestor,
+    path_is_within, path_key, probe_git_identity, GitIdentity,
+};
 use crate::tools::workspace::tool_err_code;
 
-const GIT_TIMEOUT: Duration = Duration::from_secs(5);
+const GIT_TIMEOUT: Duration = crate::tools::execution_context::GIT_TIMEOUT;
 const DEFAULT_TTL_MINUTES: u64 = 120;
 const MIN_TTL_MINUTES: u64 = 5;
 const MAX_TTL_MINUTES: u64 = 480;
@@ -193,6 +194,16 @@ impl WorkspaceContextPin {
         Ok(identity)
     }
 
+    pub fn git_identity(&self) -> GitIdentity {
+        GitIdentity {
+            root: self.active_root.clone(),
+            git_dir: self.git_dir.clone(),
+            git_common_dir: self.git_common_dir.clone(),
+            branch: self.branch.clone(),
+            head: self.last_head.clone(),
+        }
+    }
+
     pub fn snapshot(&self, status: &str, message: Option<&str>) -> Value {
         json!({
             "locked": true,
@@ -220,15 +231,6 @@ impl WorkspaceContextPin {
 }
 
 #[derive(Clone, Debug)]
-pub struct GitIdentity {
-    pub root: PathBuf,
-    pub git_dir: PathBuf,
-    pub git_common_dir: PathBuf,
-    pub branch: String,
-    pub head: String,
-}
-
-#[derive(Clone, Debug)]
 pub struct ContextError {
     pub code: &'static str,
     pub message: String,
@@ -252,45 +254,7 @@ impl ContextError {
 }
 
 fn probe_identity(path: &Path, deadline: Instant) -> Result<GitIdentity, ContextError> {
-    let output = run_git(
-        path,
-        &[
-            "rev-parse",
-            "--path-format=absolute",
-            "--show-toplevel",
-            "--absolute-git-dir",
-            "--git-common-dir",
-            "--verify",
-            "HEAD",
-        ],
-        deadline,
-    )?;
-    require_success(&output, "The path is not a usable Git worktree.")?;
-    let lines = output.stdout.lines().map(str::trim).collect::<Vec<_>>();
-    if lines.len() != 4 {
-        return Err(ContextError::new(
-            "WORKTREE_ROOT_REQUIRED",
-            "Git returned an incomplete worktree identity.",
-        ));
-    }
-    let branch = run_git(
-        path,
-        &["symbolic-ref", "--quiet", "--short", "HEAD"],
-        deadline,
-    )?;
-    if !branch.status.success() {
-        return Err(ContextError::new(
-            "WORKSPACE_CONTEXT_MISMATCH",
-            "Detached HEAD worktrees cannot be pinned.",
-        ));
-    }
-    Ok(GitIdentity {
-        root: canonical_directory(Path::new(lines[0]))?,
-        git_dir: canonical_path(Path::new(lines[1]))?,
-        git_common_dir: canonical_path(Path::new(lines[2]))?,
-        branch: branch.stdout.trim().to_string(),
-        head: lines[3].to_string(),
-    })
+    probe_git_identity(path, deadline).map_err(|error| ContextError::new(error.code, error.message))
 }
 
 fn is_ancestor(
@@ -299,127 +263,13 @@ fn is_ancestor(
     descendant: &str,
     deadline: Instant,
 ) -> Result<bool, ContextError> {
-    let output = run_git(
-        root,
-        &["merge-base", "--is-ancestor", ancestor, descendant],
-        deadline,
-    )?;
-    match output.status.code() {
-        Some(0) => Ok(true),
-        Some(1) => Ok(false),
-        _ => Err(ContextError::new(
-            "WORKSPACE_CONTEXT_MISMATCH",
-            format!(
-                "Git could not compare HEAD ancestry: {}",
-                output.stderr.trim()
-            ),
-        )),
-    }
-}
-
-struct GitOutput {
-    status: ExitStatus,
-    stdout: String,
-    stderr: String,
-}
-
-fn run_git(path: &Path, args: &[&str], deadline: Instant) -> Result<GitOutput, ContextError> {
-    let mut child = Command::new("git")
-        .arg("-C")
-        .arg(path)
-        .args(args)
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .map_err(|error| {
-            ContextError::new(
-                "WORKSPACE_CONTEXT_MISMATCH",
-                format!("Failed to start Git: {error}"),
-            )
-        })?;
-    let status = loop {
-        if let Some(status) = child.try_wait().map_err(|error| {
-            ContextError::new(
-                "WORKSPACE_CONTEXT_MISMATCH",
-                format!("Failed to inspect Git: {error}"),
-            )
-        })? {
-            break status;
-        }
-        if Instant::now() >= deadline {
-            let _ = child.kill();
-            let _ = child.wait();
-            return Err(ContextError::new(
-                "WORKSPACE_CONTEXT_MISMATCH",
-                "Git worktree validation exceeded 5 seconds.",
-            ));
-        }
-        thread::sleep(Duration::from_millis(10));
-    };
-    let mut stdout = String::new();
-    let mut stderr = String::new();
-    if let Some(mut stream) = child.stdout.take() {
-        let _ = stream.read_to_string(&mut stdout);
-    }
-    if let Some(mut stream) = child.stderr.take() {
-        let _ = stream.read_to_string(&mut stderr);
-    }
-    Ok(GitOutput {
-        status,
-        stdout,
-        stderr,
-    })
-}
-
-fn require_success(output: &GitOutput, message: &str) -> Result<(), ContextError> {
-    if output.status.success() {
-        Ok(())
-    } else {
-        Err(ContextError::new(
-            "WORKTREE_ROOT_REQUIRED",
-            format!("{message} {}", output.stderr.trim()),
-        ))
-    }
+    execution_is_ancestor(root, ancestor, descendant, deadline)
+        .map_err(|error| ContextError::new(error.code, error.message))
 }
 
 fn canonical_directory(path: &Path) -> Result<PathBuf, ContextError> {
-    let canonical = canonical_path(path)?;
-    if !canonical.is_dir() {
-        return Err(ContextError::new(
-            "WORKSPACE_CONTEXT_PATH_INVALID",
-            "Workspace context path must be a directory.",
-        ));
-    }
-    Ok(canonical)
-}
-
-fn canonical_path(path: &Path) -> Result<PathBuf, ContextError> {
-    path.canonicalize().map_err(|_| {
-        ContextError::new(
-            "WORKSPACE_CONTEXT_PATH_INVALID",
-            format!("Path does not exist: {}", path.display()),
-        )
-    })
-}
-
-fn path_key(path: &Path) -> String {
-    let key = path
-        .to_string_lossy()
-        .replace('\\', "/")
-        .trim_end_matches('/')
-        .to_string();
-    if cfg!(windows) {
-        key.to_ascii_lowercase()
-    } else {
-        key
-    }
-}
-
-fn path_is_within(root: &Path, path: &Path) -> bool {
-    let root = path_key(root);
-    let path = path_key(path);
-    path == root || path.starts_with(&format!("{root}/"))
+    execution_canonical_directory(path)
+        .map_err(|error| ContextError::new(error.code, error.message))
 }
 
 fn is_protected_branch(branch: &str) -> bool {

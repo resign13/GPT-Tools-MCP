@@ -93,9 +93,8 @@ pub fn get_webview_memory_sample() -> AppResult<WebviewMemorySample> {
 /// keepalive window first so "last window closed" never fires for the main UI.
 #[command]
 pub async fn recreate_ui_webview(app: AppHandle) -> AppResult<()> {
-    let _guard = RecreateGuard::try_enter().ok_or_else(|| {
-        AppError::Message("UI webview recreation is already in progress".into())
-    })?;
+    let _guard = RecreateGuard::try_enter()
+        .ok_or_else(|| AppError::Message("UI webview recreation is already in progress".into()))?;
 
     // Drop any leftover keepalive from a previous failed attempt.
     if let Some(stale) = app.get_webview_window(KEEPALIVE_LABEL) {
@@ -126,24 +125,18 @@ pub async fn recreate_ui_webview(app: AppHandle) -> AppResult<()> {
     let _ = window.show();
     tokio::time::sleep(std::time::Duration::from_millis(200)).await;
 
-    let outer_position = window
-        .outer_position()
-        .ok()
-        .filter(is_sane_position);
+    let outer_position = window.outer_position().ok().filter(is_sane_position);
     let outer_size = window.outer_size().ok().filter(is_sane_size);
 
     // Keepalive window: ensures destroy(main) is not "close last window → exit".
-    let keepalive = WebviewWindowBuilder::new(
-        &app,
-        KEEPALIVE_LABEL,
-        WebviewUrl::App("index.html".into()),
-    )
-    .visible(false)
-    .skip_taskbar(true)
-    .title(" ")
-    .inner_size(1.0, 1.0)
-    .build()
-    .map_err(|err| AppError::Message(format!("keepalive window failed: {err}")))?;
+    let keepalive =
+        WebviewWindowBuilder::new(&app, KEEPALIVE_LABEL, WebviewUrl::App("index.html".into()))
+            .visible(false)
+            .skip_taskbar(true)
+            .title(" ")
+            .inner_size(1.0, 1.0)
+            .build()
+            .map_err(|err| AppError::Message(format!("keepalive window failed: {err}")))?;
 
     window
         .destroy()
@@ -170,27 +163,20 @@ pub async fn recreate_ui_webview(app: AppHandle) -> AppResult<()> {
             // A destroyed WebView can remain registered briefly on Windows, so
             // rebuilding with the original `main` label may fail. Use a fresh
             // UI label as a recovery path instead of returning with no window.
-            let recovery_label = format!(
-                "{label}-recovered-{}",
-                uuid::Uuid::new_v4().simple()
-            );
+            let recovery_label = format!("{label}-recovered-{}", uuid::Uuid::new_v4().simple());
             eprintln!(
                 "[ui-memory] configured webview rebuild failed ({config_err}); trying {recovery_label}"
             );
-            WebviewWindowBuilder::new(
-                &app,
-                &recovery_label,
-                WebviewUrl::App("index.html".into()),
-            )
-            .title("Coding Tools MCP")
-            .inner_size(1280.0, 800.0)
-            .min_inner_size(960.0, 640.0)
-            .build()
-            .map_err(|err| {
-                AppError::Message(format!(
-                    "rebuild webview failed ({config_err}); recovery also failed: {err}"
-                ))
-            })?
+            WebviewWindowBuilder::new(&app, &recovery_label, WebviewUrl::App("index.html".into()))
+                .title("Coding Tools MCP")
+                .inner_size(1280.0, 800.0)
+                .min_inner_size(960.0, 640.0)
+                .build()
+                .map_err(|err| {
+                    AppError::Message(format!(
+                        "rebuild webview failed ({config_err}); recovery also failed: {err}"
+                    ))
+                })?
         }
     };
 

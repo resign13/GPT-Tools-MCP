@@ -5,12 +5,13 @@ use image::codecs::{jpeg::JpegEncoder, png::PngEncoder};
 use image::{DynamicImage, ImageFormat, ImageReader};
 use serde_json::{json, Value};
 
-use crate::tools::workspace::{tool_ok, Workspace, WorkspaceError};
+use crate::tools::context::ToolContext;
+use crate::tools::workspace::{tool_ok, WorkspaceError};
 
 const DEFAULT_MAX_BYTES: usize = 5_242_880;
 const DEFAULT_MAX_DIMENSION: u32 = 2000;
 
-pub fn view_image(ws: &Workspace, args: &Value) -> Result<Value, WorkspaceError> {
+pub fn view_image(ctx: &ToolContext, args: &Value) -> Result<Value, WorkspaceError> {
     let path = args
         .get("path")
         .and_then(Value::as_str)
@@ -27,9 +28,12 @@ pub fn view_image(ws: &Workspace, args: &Value) -> Result<Value, WorkspaceError>
         .get("max_height")
         .and_then(Value::as_u64)
         .unwrap_or(DEFAULT_MAX_DIMENSION as u64) as u32;
-    let auto_resize = args.get("auto_resize").and_then(Value::as_bool).unwrap_or(true);
+    let auto_resize = args
+        .get("auto_resize")
+        .and_then(Value::as_bool)
+        .unwrap_or(true);
 
-    let resolved = ws.resolve_read_path(path)?;
+    let resolved = ctx.resolve_read_from_default_cwd(path)?;
     let mut data = std::fs::read(&resolved.path).map_err(|e| WorkspaceError::Tool {
         code: "IO_ERROR",
         message: format!("Failed to read image: {e}"),
@@ -55,9 +59,8 @@ pub fn view_image(ws: &Workspace, args: &Value) -> Result<Value, WorkspaceError>
                 (mime_type, width, height) = identify_image(&data)?;
                 resized = true;
             }
-            Ok(None) => warnings.push(
-                "auto_resize requested but image resize failed or format unsupported".into(),
-            ),
+            Ok(None) => warnings
+                .push("auto_resize requested but image resize failed or format unsupported".into()),
             Err(err) => warnings.push(format!("auto_resize failed: {err}")),
         }
     }
@@ -140,9 +143,7 @@ fn resize_image(
     match mime_type {
         "image/png" => {
             let enc = PngEncoder::new(&mut out);
-            thumb
-                .write_with_encoder(enc)
-                .map_err(|e| e.to_string())?;
+            thumb.write_with_encoder(enc).map_err(|e| e.to_string())?;
             if out.len() > max_bytes {
                 return encode_jpeg(&thumb, max_bytes);
             }
@@ -158,8 +159,7 @@ fn encode_jpeg(img: &DynamicImage, max_bytes: usize) -> Result<Option<(Vec<u8>, 
     for quality in [85u8, 70, 55, 40] {
         let mut out = Vec::new();
         let enc = JpegEncoder::new_with_quality(&mut out, quality);
-        img.write_with_encoder(enc)
-            .map_err(|e| e.to_string())?;
+        img.write_with_encoder(enc).map_err(|e| e.to_string())?;
         if out.len() <= max_bytes {
             return Ok(Some((out, "image/jpeg".into())));
         }

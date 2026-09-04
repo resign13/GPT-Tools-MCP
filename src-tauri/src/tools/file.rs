@@ -8,18 +8,19 @@ use regex::Regex;
 use serde_json::{json, Value};
 use walkdir::WalkDir;
 
+use crate::tools::context::ToolContext;
 use crate::tools::workspace::{relative_display, tool_ok, Workspace, WorkspaceError};
 
 /// Default per-file cap for `search_text` to avoid loading multi-GB assets.
 const DEFAULT_SEARCH_MAX_FILE_BYTES: u64 = 2 * 1024 * 1024;
 const BINARY_PEEK_BYTES: usize = 8192;
 
-pub fn read_file(ws: &Workspace, args: &Value) -> Result<Value, WorkspaceError> {
+pub fn read_file(ctx: &ToolContext, args: &Value) -> Result<Value, WorkspaceError> {
     let path = args
         .get("path")
         .and_then(Value::as_str)
         .ok_or_else(|| WorkspaceError::invalid_argument("path is required"))?;
-    let resolved = ws.resolve_read_path(path)?;
+    let resolved = ctx.resolve_read_from_default_cwd(path)?;
     if resolved.path.is_dir() {
         return Err(WorkspaceError::Tool {
             code: "IS_DIRECTORY",
@@ -37,7 +38,10 @@ pub fn read_file(ws: &Workspace, args: &Value) -> Result<Value, WorkspaceError> 
         .and_then(Value::as_u64)
         .unwrap_or(1)
         .max(1) as usize;
-    let end_line = args.get("end_line").and_then(Value::as_u64).map(|v| v as usize);
+    let end_line = args
+        .get("end_line")
+        .and_then(Value::as_u64)
+        .map(|v| v as usize);
 
     let data = fs::read(&resolved.path).map_err(|_| WorkspaceError::not_found("File not found"))?;
     if data.iter().take(4096).any(|b| *b == 0) {
@@ -87,13 +91,17 @@ pub fn read_file(ws: &Workspace, args: &Value) -> Result<Value, WorkspaceError> 
     })))
 }
 
-pub fn list_dir(ws: &Workspace, args: &Value) -> Result<Value, WorkspaceError> {
+pub fn list_dir(ctx: &ToolContext, args: &Value) -> Result<Value, WorkspaceError> {
+    let ws = &ctx.workspace;
     let path = args.get("path").and_then(Value::as_str).unwrap_or(".");
-    let resolved = ws.resolve_read_path(path)?;
+    let resolved = ctx.resolve_read_from_default_cwd(path)?;
     if !resolved.path.is_dir() {
         return Err(WorkspaceError::not_a_directory("Path is not a directory"));
     }
-    let recursive = args.get("recursive").and_then(Value::as_bool).unwrap_or(false);
+    let recursive = args
+        .get("recursive")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
     let max_depth = args
         .get("max_depth")
         .and_then(Value::as_u64)
@@ -126,6 +134,7 @@ pub fn list_dir(ws: &Workspace, args: &Value) -> Result<Value, WorkspaceError> {
         max_entries,
         &mut entries,
         &mut truncated,
+        &ctx.execution_root(),
     );
     entries.sort_by(|a, b| a["name"].as_str().cmp(&b["name"].as_str()));
     Ok(tool_ok(json!({
@@ -136,9 +145,10 @@ pub fn list_dir(ws: &Workspace, args: &Value) -> Result<Value, WorkspaceError> {
     })))
 }
 
-pub fn list_files(ws: &Workspace, args: &Value) -> Result<Value, WorkspaceError> {
+pub fn list_files(ctx: &ToolContext, args: &Value) -> Result<Value, WorkspaceError> {
+    let ws = &ctx.workspace;
     let path = args.get("path").and_then(Value::as_str).unwrap_or(".");
-    let resolved = ws.resolve_read_path(path)?;
+    let resolved = ctx.resolve_read_from_default_cwd(path)?;
     if !resolved.path.is_dir() {
         return Err(WorkspaceError::not_a_directory("Path is not a directory"));
     }
@@ -159,9 +169,14 @@ pub fn list_files(ws: &Workspace, args: &Value) -> Result<Value, WorkspaceError>
 
     let mut files = Vec::new();
     let mut truncated = false;
+    let execution_root = ctx.execution_root();
     for entry in WalkDir::new(&resolved.path)
         .follow_links(false)
         .into_iter()
+        .filter_entry(|entry| {
+            entry.path() == resolved.path
+                || !is_nested_git_worktree_root(&execution_root, entry.path())
+        })
         .filter_map(Result::ok)
     {
         let p = entry.path();
@@ -208,13 +223,14 @@ pub fn list_files(ws: &Workspace, args: &Value) -> Result<Value, WorkspaceError>
     })))
 }
 
-pub fn search_text(ws: &Workspace, args: &Value) -> Result<Value, WorkspaceError> {
+pub fn search_text(ctx: &ToolContext, args: &Value) -> Result<Value, WorkspaceError> {
+    let ws = &ctx.workspace;
     let query = args
         .get("query")
         .and_then(Value::as_str)
         .ok_or_else(|| WorkspaceError::invalid_argument("query is required"))?;
     let path = args.get("path").and_then(Value::as_str).unwrap_or(".");
-    let resolved = ws.resolve_read_path(path)?;
+    let resolved = ctx.resolve_read_from_default_cwd(path)?;
     let use_regex = args.get("regex").and_then(Value::as_bool).unwrap_or(false);
     let case_sensitive = args
         .get("case_sensitive")
@@ -297,9 +313,14 @@ pub fn search_text(ws: &Workspace, args: &Value) -> Result<Value, WorkspaceError
     if resolved.path.is_file() {
         let _ = consider_file(&resolved.path);
     } else {
+        let execution_root = ctx.execution_root();
         for entry in WalkDir::new(&resolved.path)
             .follow_links(false)
             .into_iter()
+            .filter_entry(|entry| {
+                entry.path() == resolved.path
+                    || !is_nested_git_worktree_root(&execution_root, entry.path())
+            })
             .filter_map(Result::ok)
         {
             if !entry.file_type().is_file() {
@@ -543,6 +564,7 @@ fn collect_dir_entries(
     max_entries: usize,
     entries: &mut Vec<Value>,
     truncated: &mut bool,
+    execution_root: &Path,
 ) {
     let read_dir = match fs::read_dir(dir) {
         Ok(rd) => rd,
@@ -553,6 +575,11 @@ fn collect_dir_entries(
             return;
         }
         let p = item.path();
+        if p != execution_root && p.join(".git").exists() {
+            // A nested repository/worktree is a separate execution context. Do
+            // not expose or recursively traverse its files from the parent.
+            continue;
+        }
         if ws.is_ignored_path(&p, include_hidden, include_ignored) {
             continue;
         }
@@ -599,9 +626,14 @@ fn collect_dir_entries(
                 max_entries,
                 entries,
                 truncated,
+                execution_root,
             );
         }
     }
+}
+
+fn is_nested_git_worktree_root(execution_root: &Path, path: &Path) -> bool {
+    path != execution_root && path.join(".git").exists()
 }
 
 fn truncate_bytes(text: &str, max_bytes: usize) -> (String, bool, Option<&'static str>) {
@@ -613,11 +645,7 @@ fn truncate_bytes(text: &str, max_bytes: usize) -> (String, bool, Option<&'stati
     while end > 0 && !text.is_char_boundary(end) {
         end -= 1;
     }
-    (
-        text[..end].to_string(),
-        true,
-        Some("bytes"),
-    )
+    (text[..end].to_string(), true, Some("bytes"))
 }
 
 fn string_list_arg(args: &Value, key: &str) -> Vec<String> {
@@ -681,9 +709,7 @@ fn simple_glob(pattern: &str, text: &str) -> bool {
 
 fn format_mtime(st: Option<SystemTime>) -> Option<String> {
     st.map(|t| {
-        let d = t
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default();
+        let d = t.duration_since(std::time::UNIX_EPOCH).unwrap_or_default();
         format!("{}.{:03}Z", d.as_secs(), d.subsec_millis())
     })
 }

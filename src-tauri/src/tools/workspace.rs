@@ -3,6 +3,8 @@ use std::path::{Component, Path, PathBuf};
 use serde_json::{json, Value};
 use thiserror::Error;
 
+use crate::tools::execution_context::is_related_worktree;
+
 pub const DEFAULT_EXCLUDED_NAMES: &[&str] = &[
     ".git",
     ".reference",
@@ -141,28 +143,57 @@ pub type WorkspaceResult<T> = Result<T, WorkspaceError>;
 
 #[derive(Debug, Clone)]
 pub struct Workspace {
-    root: PathBuf,
+    repository_root: PathBuf,
+    active_root: PathBuf,
 }
 
 impl Workspace {
     pub fn new(root: PathBuf) -> WorkspaceResult<Self> {
-        let root = root
+        Self::new_with_roots(root.clone(), root)
+    }
+
+    /// Build a workspace with an explicit repository root and active execution root.
+    pub fn new_with_roots(repository_root: PathBuf, active_root: PathBuf) -> WorkspaceResult<Self> {
+        let repository_root = repository_root
             .canonicalize()
             .map_err(|_| WorkspaceError::invalid_argument("Workspace root must exist"))?;
-        if !root.is_dir() {
+        if !repository_root.is_dir() {
             return Err(WorkspaceError::invalid_argument(
                 "Workspace root must be a directory",
             ));
         }
-        Ok(Self { root })
+        let active_root = active_root
+            .canonicalize()
+            .map_err(|_| WorkspaceError::invalid_argument("Active workspace root must exist"))?;
+        if !active_root.is_dir() {
+            return Err(WorkspaceError::invalid_argument(
+                "Active workspace root must be a directory",
+            ));
+        }
+        if !is_related_worktree(&repository_root, &active_root) {
+            return Err(WorkspaceError::path_outside_workspace());
+        }
+        Ok(Self {
+            repository_root,
+            active_root,
+        })
     }
 
+    /// Compatibility alias: existing tools operate on the active execution root.
     pub fn root(&self) -> &Path {
-        &self.root
+        &self.active_root
+    }
+
+    pub fn repository_root(&self) -> &Path {
+        &self.repository_root
+    }
+
+    pub fn active_root(&self) -> &Path {
+        &self.active_root
     }
 
     pub fn root_display(&self) -> String {
-        self.root.to_string_lossy().into_owned()
+        self.active_root.to_string_lossy().into_owned()
     }
 
     pub fn reject_unsafe_text(&self, raw_path: &str) -> WorkspaceResult<()> {
@@ -192,7 +223,7 @@ impl Workspace {
     }
 
     pub fn resolve_existing(&self, raw_path: &str) -> WorkspaceResult<ResolvedPath> {
-        self.resolve_existing_at(&self.root, raw_path)
+        self.resolve_existing_at(&self.active_root, raw_path)
     }
 
     /// 解析只读路径。显式的绝对路径和 `..` 路径允许指向 Workspace 外部，
@@ -204,7 +235,7 @@ impl Workspace {
         let candidate = if input.is_absolute() {
             input.to_path_buf()
         } else {
-            self.root
+            self.active_root
                 .join(raw.replace('/', std::path::MAIN_SEPARATOR_STR))
         };
         let resolved = candidate
@@ -214,11 +245,11 @@ impl Workspace {
             || input
                 .components()
                 .any(|part| matches!(part, Component::ParentDir));
-        if !explicit_external && candidate.starts_with(&self.root) {
+        if !explicit_external && path_is_within(&self.active_root, &candidate) {
             self.ensure_inside_workspace(&candidate, &resolved)?;
         }
         Ok(ResolvedPath {
-            display: relative_display(&self.root, &resolved),
+            display: relative_display(&self.active_root, &resolved),
             path: resolved,
             existed: true,
         })
@@ -238,7 +269,7 @@ impl Workspace {
             .map_err(|_| WorkspaceError::not_found(format!("Path not found: {raw}")))?;
         self.ensure_inside_workspace(&candidate, &resolved)?;
         Ok(ResolvedPath {
-            display: relative_display(&self.root, &resolved),
+            display: relative_display(&self.active_root, &resolved),
             path: resolved,
             existed: true,
         })
@@ -252,7 +283,7 @@ impl Workspace {
             return Err(WorkspaceError::invalid_argument("Invalid write target"));
         }
         let candidate = self
-            .root
+            .active_root
             .join(raw_path.replace('/', std::path::MAIN_SEPARATOR_STR));
         if candidate.exists() || candidate.is_symlink() {
             let resolved = candidate
@@ -260,12 +291,12 @@ impl Workspace {
                 .map_err(|_| WorkspaceError::not_found(format!("Path not found: {raw_path}")))?;
             self.ensure_inside_workspace(&candidate, &resolved)?;
             return Ok(ResolvedPath {
-                display: relative_display(&self.root, &resolved),
+                display: relative_display(&self.active_root, &resolved),
                 path: resolved,
                 existed: true,
             });
         }
-        let parent = candidate.parent().unwrap_or(&self.root);
+        let parent = candidate.parent().unwrap_or(&self.active_root);
         let resolved_parent = if parent.exists() {
             parent
                 .canonicalize()
@@ -274,7 +305,7 @@ impl Workspace {
             self.ensure_parent_chain(parent)?;
             parent.to_path_buf()
         };
-        if !resolved_parent.starts_with(&self.root) {
+        if !path_is_within(&self.active_root, &resolved_parent) {
             return Err(WorkspaceError::path_outside_workspace());
         }
         Ok(ResolvedPath {
@@ -287,7 +318,7 @@ impl Workspace {
     fn ensure_parent_chain(&self, parent: &Path) -> WorkspaceResult<()> {
         let mut cursor = parent;
         while !cursor.exists() {
-            if cursor == self.root || cursor.parent() == Some(cursor) {
+            if cursor == self.active_root || cursor.parent() == Some(cursor) {
                 break;
             }
             cursor = cursor.parent().unwrap_or(cursor);
@@ -296,7 +327,7 @@ impl Workspace {
             let resolved = cursor
                 .canonicalize()
                 .map_err(|_| WorkspaceError::not_found("Parent directory not found"))?;
-            if !resolved.starts_with(&self.root) {
+            if !path_is_within(&self.active_root, &resolved) {
                 return Err(WorkspaceError::path_outside_workspace());
             }
         }
@@ -310,14 +341,14 @@ impl Workspace {
         if !resolved.is_dir() {
             return Err(WorkspaceError::not_a_directory("Base is not a directory"));
         }
-        if !resolved.starts_with(&self.root) {
+        if !path_is_within(&self.active_root, &resolved) {
             return Err(WorkspaceError::path_outside_workspace());
         }
         Ok(resolved)
     }
 
     fn ensure_inside_workspace(&self, candidate: &Path, resolved: &Path) -> WorkspaceResult<()> {
-        if !resolved.starts_with(&self.root) {
+        if !path_is_within(&self.active_root, resolved) {
             if candidate.is_symlink() {
                 return Err(WorkspaceError::symlink_escape());
             }
@@ -329,7 +360,7 @@ impl Workspace {
     pub fn reject_write_symlink(&self, raw_path: &str) -> WorkspaceResult<()> {
         self.reject_unsafe_text(raw_path)?;
         let candidate = self
-            .root
+            .active_root
             .join(raw_path.replace('/', std::path::MAIN_SEPARATOR_STR));
         if candidate.is_symlink() {
             return Err(WorkspaceError::symlink_escape());
@@ -364,7 +395,7 @@ impl Workspace {
         include_hidden: bool,
         include_ignored: bool,
     ) -> bool {
-        let Ok(scan_path) = path.strip_prefix(&self.root) else {
+        let Ok(scan_path) = path.strip_prefix(&self.active_root) else {
             // Workspace 外的读取路径不套用 Workspace 内部的隐藏/构建目录过滤，
             // 否则 Windows 临时目录等路径会被误判为隐藏目录而无法读取。
             return false;
@@ -395,13 +426,32 @@ impl Workspace {
 
     pub fn is_safe_existing_path(&self, path: &Path) -> bool {
         path.canonicalize()
-            .map(|p| p.starts_with(&self.root))
+            .map(|p| path_is_within(&self.active_root, &p))
             .unwrap_or(false)
     }
 
     pub fn is_safe_read_path(&self, path: &Path) -> bool {
         path.exists() || path.is_symlink()
     }
+}
+
+fn path_key(path: &Path) -> String {
+    let key = path
+        .to_string_lossy()
+        .replace('\\', "/")
+        .trim_end_matches('/')
+        .to_string();
+    if cfg!(windows) {
+        key.to_ascii_lowercase()
+    } else {
+        key
+    }
+}
+
+fn path_is_within(root: &Path, path: &Path) -> bool {
+    let root = path_key(root);
+    let path = path_key(path);
+    path == root || path.starts_with(&format!("{root}/"))
 }
 
 pub fn relative_display(root: &Path, path: &Path) -> String {

@@ -169,7 +169,11 @@ impl DataStore {
         self.save()
     }
 
-    pub fn regenerate_workspace_secret(&mut self, profile_id: &str, key: &str) -> AppResult<String> {
+    pub fn regenerate_workspace_secret(
+        &mut self,
+        profile_id: &str,
+        key: &str,
+    ) -> AppResult<String> {
         let value = shared_value_for_key(key);
         self.set_workspace_secret(profile_id, key, &value)?;
         Ok(value)
@@ -224,7 +228,6 @@ impl DataStore {
         }
         self.save()
     }
-
 }
 
 fn lock_data_file() -> AppResult<std::sync::MutexGuard<'static, ()>> {
@@ -290,8 +293,7 @@ mod tests {
         host.gateway.enabled = true;
         host.gateway.workspace_ids = vec!["host".into(), "target".into()];
 
-        let mut target =
-            WorkspaceProfile::new("C:/workspace/target".into(), Some("target".into()));
+        let mut target = WorkspaceProfile::new("C:/workspace/target".into(), Some("target".into()));
         target.id = "target".into();
 
         let mut data = AppData {
