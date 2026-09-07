@@ -68,3 +68,15 @@ This project is indexed by GitNexus as **coding-tools-mcp** (3894 symbols, 9221 
 | Index, status, clean, wiki CLI commands | `.claude/skills/gitnexus/gitnexus-cli/SKILL.md` |
 
 <!-- gitnexus:end -->
+
+## 当前开发进度（2026-09-07）
+
+- 当前分支：`codex/permission-development`
+- 当前工作计划：`bugfix-fix-full-access-development-runtime--c4507c7f4d`
+- 计划进度：`6/9`，正在执行 `src8-6 implementation`
+- 本轮目标：修复严格 Windows AppContainer 下外部运行时访问和 Git worktree 命令失败，同时保持 Workspace、worktree、受保护路径和 Sandbox 硬边界不变。
+- 已完成：恢复 AppContainer `CreateProcessW` 启动、移除失败的 restricted-token 路径、保留 AppContainer SID 校验、保留 `.git/.github` 保护 ACL、增加私有 Sandbox 临时目录遍历授权、增加 Git 运行时暂存及 Git 环境隔离。
+- 当前验证：`cmd`、`whoami`、Python、Node 和 `git --version` 均可在 `sandbox_enforced=true` 下运行；Git 仓库子命令仍报告 `Unable to read current working directory: Permission denied`，正在处理 Git for Windows 的 cwd 兼容层。
+- 当前临时诊断：`src-tauri/tests/runtime_compatibility.rs` 仍包含 cwd/API、ACL、Git session 等诊断输出；`src-tauri/src/tools/exec.rs` 仍包含 Git 包装器诊断环境变量，完成根因验证后会收敛为最小回归测试。
+- 已同步远程：本地 `main` 提交 `665e50966b373badee4627259024ab0b89054967` 已推送到 `origin/main`；本分支未提交修复未推送。
+- 下一步：确认 Git 包装器继承的 Win32 cwd 行为，移除临时诊断，保留 `cmd/whoami/Python/Node/Git` 最小兼容回归，然后执行 `plan_heartbeat` 推进 `src8-7` 和 `src8-8`。
