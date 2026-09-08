@@ -230,6 +230,169 @@ fn search_and_read_return_precise_lossless_archive_pages() {
 }
 
 #[test]
+fn synopsis_is_bounded_redacted_and_projected_to_state_and_search() {
+    let (workspace, _harness, ctx) = test_context();
+    let boot = invoke_ok(
+        &ctx,
+        "history_session_bootstrap",
+        json!({
+            "session_key": "synopsis-session",
+            "title": "上下文优化",
+            "initial_user_input": format!("实现 synopsis 导航 password=do-not-leak {}", "x".repeat(2_000))
+        }),
+    );
+    let synopsis = boot["state"]["current_session"]["synopsis"]
+        .as_str()
+        .expect("state synopsis");
+    assert!(synopsis.len() <= 512);
+    assert!(synopsis.contains("上下文优化"));
+    assert!(!synopsis.contains("do-not-leak"));
+
+    let search = invoke_ok(
+        &ctx,
+        "history_session_search",
+        json!({"query": "synopsis 导航"}),
+    );
+    let hit = &search["results"][0];
+    assert_eq!(hit["number"], boot["current_number"]);
+    assert_eq!(hit["synopsis"], synopsis);
+    assert!(hit["synopsis"].as_str().unwrap_or("").len() <= 512);
+
+    let manifest = fs::read_to_string(
+        workspace
+            .path()
+            .join("docs/history-session/memory/manifest.json"),
+    )
+    .expect("read manifest");
+    let manifest: Value = serde_json::from_str(&manifest).expect("parse manifest");
+    assert_eq!(manifest["version"], 3);
+    assert_eq!(manifest["entries"][0]["synopsis"], synopsis);
+}
+
+#[test]
+fn search_rebuilds_synopsis_for_a_legacy_manifest() {
+    let (workspace, _harness, ctx) = test_context();
+    let boot = invoke_ok(
+        &ctx,
+        "history_session_bootstrap",
+        json!({
+            "session_key": "legacy-manifest-session",
+            "title": "旧 manifest 兼容",
+            "initial_user_input": "保留旧派生文件并重建 synopsis"
+        }),
+    );
+    let manifest_path = workspace
+        .path()
+        .join("docs/history-session/memory/manifest.json");
+    let mut manifest: Value =
+        serde_json::from_str(&fs::read_to_string(&manifest_path).expect("read manifest"))
+            .expect("parse manifest");
+    manifest["version"] = json!(2);
+    for entry in manifest["entries"].as_array_mut().expect("manifest entries") {
+        entry.as_object_mut().expect("manifest entry").remove("synopsis");
+    }
+    fs::write(
+        &manifest_path,
+        serde_json::to_vec_pretty(&manifest).expect("serialize legacy manifest"),
+    )
+    .expect("write legacy manifest");
+    let state_path = workspace
+        .path()
+        .join("docs/history-session/memory/state.json");
+    let mut state: Value =
+        serde_json::from_str(&fs::read_to_string(&state_path).expect("read state"))
+            .expect("parse state");
+    state["current_session"]
+        .as_object_mut()
+        .expect("current session")
+        .remove("synopsis");
+    for reference in state["references"].as_array_mut().expect("state references") {
+        reference
+            .as_object_mut()
+            .expect("state reference")
+            .remove("synopsis");
+    }
+    fs::write(
+        &state_path,
+        serde_json::to_vec_pretty(&state).expect("serialize legacy state"),
+    )
+    .expect("write legacy state");
+
+    let search = invoke_ok(
+        &ctx,
+        "history_session_search",
+        json!({"query": "重建 synopsis"}),
+    );
+    assert_eq!(search["results"][0]["number"], boot["current_number"]);
+    assert!(search["results"][0]["synopsis"]
+        .as_str()
+        .unwrap_or("")
+        .contains("旧 manifest 兼容"));
+
+    let resumed = invoke_ok(
+        &ctx,
+        "history_session_bootstrap",
+        json!({"session_key": "legacy-manifest-session"}),
+    );
+    assert!(resumed["state"]["current_session"]["synopsis"]
+        .as_str()
+        .unwrap_or("")
+        .contains("旧 manifest 兼容"));
+    let rewritten: Value =
+        serde_json::from_str(&fs::read_to_string(&manifest_path).expect("read rewritten manifest"))
+            .expect("parse rewritten manifest");
+    assert_eq!(rewritten["version"], 3);
+    assert!(rewritten["entries"][0].get("synopsis").is_some());
+}
+
+#[test]
+fn search_prioritizes_title_then_synopsis_then_body() {
+    let (workspace, _harness, ctx) = test_context();
+    invoke_ok(
+        &ctx,
+        "history_session_bootstrap",
+        json!({
+            "session_key": "title-match",
+            "title": "needle 标题命中",
+            "initial_user_input": "无关目标"
+        }),
+    );
+    invoke_ok(
+        &ctx,
+        "history_session_bootstrap",
+        json!({
+            "session_key": "synopsis-match",
+            "title": "普通标题",
+            "initial_user_input": "needle 摘要命中"
+        }),
+    );
+    invoke_ok(
+        &ctx,
+        "history_session_bootstrap",
+        json!({
+            "session_key": "body-match",
+            "title": "另一个普通标题",
+            "initial_user_input": "无关目标"
+        }),
+    );
+    let body_path = workspace.path().join("docs/history-session/3.md");
+    let mut body_archive = fs::read_to_string(&body_path).expect("read body archive");
+    body_archive.push_str("\nneedle 仅正文命中\n");
+    fs::write(body_path, body_archive).expect("write body archive");
+
+    let search = invoke_ok(
+        &ctx,
+        "history_session_search",
+        json!({"query": "needle", "limit": 10}),
+    );
+    let results = search["results"].as_array().expect("search results");
+    assert_eq!(results[0]["number"], 1);
+    assert_eq!(results[1]["number"], 2);
+    assert_eq!(results[2]["number"], 3);
+    assert_eq!(results.len(), 3);
+}
+
+#[test]
 fn read_without_max_bytes_uses_bounded_lossless_pages() {
     let (workspace, _harness, ctx) = test_context();
     let dir = workspace.path().join("docs/history-session");

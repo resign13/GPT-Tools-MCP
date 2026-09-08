@@ -122,6 +122,8 @@ pub struct ManifestEntry {
     pub sha256: String,
     #[serde(default)]
     pub keywords: Vec<String>,
+    #[serde(default)]
+    pub synopsis: String,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -137,6 +139,8 @@ pub struct MemoryReference {
     pub number: u64,
     pub path: String,
     pub reason: String,
+    #[serde(default)]
+    pub synopsis: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -161,6 +165,7 @@ pub struct SearchHit {
     pub number: u64,
     pub path: String,
     pub title: String,
+    pub synopsis: String,
     pub updated_at: String,
     pub sha256: String,
     pub score: u64,

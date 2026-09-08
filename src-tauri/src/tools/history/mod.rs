@@ -330,7 +330,8 @@ pub fn search(ctx: &ToolContext, args: &Value) -> WorkspaceResult<Value> {
         .ok()
         .flatten()
         .filter(|manifest| {
-            manifest.archive_revision == storage::build_manifest(&report).archive_revision
+            manifest.version == storage::MANIFEST_VERSION
+                && manifest.archive_revision == storage::build_manifest(&report).archive_revision
         })
         .unwrap_or_else(|| storage::build_manifest(&report));
     let query = args
@@ -357,6 +358,7 @@ pub fn search(ctx: &ToolContext, args: &Value) -> WorkspaceResult<Value> {
                 number: entry.number,
                 path: entry.path.clone(),
                 title: entry.title.clone(),
+                synopsis: entry.synopsis.clone(),
                 updated_at: entry.updated_at.clone(),
                 sha256: entry.sha256.clone(),
                 score,
@@ -535,12 +537,16 @@ fn search_score(entry: &model::ManifestEntry, content: &str, tokens: &[String]) 
         return 1;
     }
     let title = entry.title.to_lowercase();
+    let synopsis = entry.synopsis.to_lowercase();
     let keywords = entry.keywords.join(" ").to_lowercase();
     let content = content.to_lowercase();
     tokens.iter().fold(0, |score, token| {
         let mut token_score = 0;
         if title.contains(token) {
-            token_score += 16;
+            token_score += 24;
+        }
+        if synopsis.contains(token) {
+            token_score += 14;
         }
         if keywords.contains(token) {
             token_score += 10;

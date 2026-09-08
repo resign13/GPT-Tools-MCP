@@ -15,6 +15,8 @@ use super::model::{
 };
 
 pub const DEFAULT_HISTORY_DIR: &str = "docs/history-session";
+pub const MANIFEST_VERSION: u32 = 3;
+pub const SYNOPSIS_MAX_BYTES: usize = 512;
 const STATE_ITEM_LIMIT: usize = 12;
 const STATE_TEXT_LIMIT: usize = 512;
 const STATE_FOCUS_LIMIT: usize = 2_048;
@@ -291,6 +293,7 @@ pub fn build_manifest(report: &ScanReport) -> MemoryManifest {
             bytes: document.content.len() as u64,
             sha256: sha256(document.content.as_bytes()),
             keywords: keywords(document),
+            synopsis: document_synopsis(document),
         })
         .collect::<Vec<_>>();
     let mut digest = Sha256::new();
@@ -299,7 +302,7 @@ pub fn build_manifest(report: &ScanReport) -> MemoryManifest {
         digest.update(entry.sha256.as_bytes());
     }
     MemoryManifest {
-        version: 2,
+        version: MANIFEST_VERSION,
         archive_revision: format!("sha256:{:x}", digest.finalize()),
         entries,
     }
@@ -358,6 +361,7 @@ pub fn build_state(
             number: entry.number,
             path: entry.path.clone(),
             reason: "最近历史档案；可按需读取原文".into(),
+            synopsis: entry.synopsis.clone(),
         })
         .collect();
     MemoryState {
@@ -374,6 +378,7 @@ pub fn build_state(
                     number: entry.number,
                     path: entry.path.clone(),
                     reason: "当前 ChatGPT 会话档案".into(),
+                    synopsis: entry.synopsis.clone(),
                 })
         }),
         current_focus: truncate_text(&current_focus, STATE_FOCUS_LIMIT),
@@ -447,6 +452,79 @@ fn keywords(document: &HistoryDocument) -> Vec<String> {
     tokenize(&values.join(" ")).into_iter().take(32).collect()
 }
 
+fn document_synopsis(document: &HistoryDocument) -> String {
+    let title = markdown::document_title(&document.content, document.number);
+    let mut parts = Vec::new();
+    push_synopsis_part(&mut parts, "标题", &title);
+
+    let initial = markdown::parse_initial_input_records(&document.content)
+        .into_iter()
+        .max_by_key(|record| record.revision);
+    if let Some(record) = initial.as_ref() {
+        push_synopsis_part(&mut parts, "目标", &record.raw_user_input);
+    }
+
+    let checkpoints = markdown::parse_checkpoint_records(&document.content);
+    let latest = latest_revisions(&checkpoints)
+        .into_iter()
+        .max_by(|left, right| {
+            left.timestamp
+                .cmp(&right.timestamp)
+                .then_with(|| left.revision.cmp(&right.revision))
+        });
+    if let Some(record) = latest {
+        let progress = if record.user_intent.trim().is_empty() {
+            record
+                .findings
+                .first()
+                .or_else(|| record.decisions.first())
+                .map(String::as_str)
+                .unwrap_or(record.raw_user_input.as_str())
+        } else {
+            record.user_intent.as_str()
+        };
+        push_synopsis_part(&mut parts, "进展", progress);
+        let next = record
+            .remaining_issues
+            .first()
+            .or_else(|| record.next_actions.first())
+            .map(String::as_str)
+            .unwrap_or_default();
+        push_synopsis_part(&mut parts, "待办", next);
+    }
+
+    if parts.len() == 1 && title == "开发会话" {
+        if let Some(fallback) = first_body_fragment(&document.content) {
+            push_synopsis_part(&mut parts, "概览", fallback);
+        }
+    }
+    truncate_utf8(&parts.join("；"), SYNOPSIS_MAX_BYTES)
+}
+
+fn push_synopsis_part(parts: &mut Vec<String>, label: &str, value: &str) {
+    let value = safe_synopsis_text(value, 180);
+    if value.is_empty() || parts.iter().any(|part| part.ends_with(&value)) {
+        return;
+    }
+    parts.push(format!("{label}：{value}"));
+}
+
+fn safe_synopsis_text(value: &str, max_bytes: usize) -> String {
+    let mut compact = value.split_whitespace().collect::<Vec<_>>().join(" ");
+    markdown::redact_text(&mut compact);
+    truncate_utf8(compact.trim(), max_bytes)
+}
+
+fn first_body_fragment(content: &str) -> Option<&str> {
+    content.lines().find(|line| {
+        let trimmed = line.trim();
+        !trimmed.is_empty()
+            && !trimmed.starts_with('#')
+            && !trimmed.starts_with("**")
+            && !trimmed.starts_with("```")
+    })
+}
+
 pub fn tokenize(value: &str) -> Vec<String> {
     let mut tokens = value
         .split(|character: char| !character.is_alphanumeric())
@@ -465,6 +543,29 @@ pub fn truncate_text(value: &str, max_chars: usize) -> String {
     let mut text = value.chars().take(max_chars).collect::<String>();
     text.push_str("...");
     text
+}
+
+pub fn truncate_utf8(value: &str, max_bytes: usize) -> String {
+    if max_bytes == 0 {
+        return String::new();
+    }
+    if value.len() <= max_bytes {
+        return value.to_string();
+    }
+    let suffix = "...";
+    if max_bytes <= suffix.len() {
+        let mut end = max_bytes.min(value.len());
+        while end > 0 && !value.is_char_boundary(end) {
+            end -= 1;
+        }
+        return value[..end].to_string();
+    }
+    let budget = max_bytes.saturating_sub(suffix.len());
+    let mut end = budget.min(value.len());
+    while end > 0 && !value.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}{}", &value[..end], suffix)
 }
 
 pub fn write_markdown(path: &Path, content: &str) -> WorkspaceResult<()> {
