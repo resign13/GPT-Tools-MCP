@@ -227,6 +227,9 @@ impl GatewayRouter {
             ));
         }
 
+        // Match binding invalidation's lock order. Identity reconciliation must
+        // not race with a workspace selection on the provisional transport.
+        let bindings = self.bindings.lock().expect("gateway binding lock");
         let mut aliases = self.aliases.lock().expect("gateway alias lock");
         evict_expired_aliases(&mut aliases);
         let openai_canonical = openai
@@ -239,7 +242,12 @@ impl GatewayRouter {
         if let (Some(openai_key), Some(transport_key)) =
             (openai_canonical.as_ref(), transport_canonical.as_ref())
         {
-            if openai_key != transport_key {
+            let empty_transport = transport.as_ref() == Some(transport_key)
+                && !bindings.contains_key(transport_key)
+                && !aliases.iter().any(|(key, alias)| {
+                    key != transport_key && alias.canonical_key == *transport_key
+                });
+            if openai_key != transport_key && !empty_transport {
                 return Err(tool_err_code(
                     "session_identity_conflict",
                     "OpenAI conversation and MCP transport identifiers resolve to different sessions.",
@@ -259,7 +267,21 @@ impl GatewayRouter {
         // aliases are known, the conflict check above still rejects a stale
         // pair instead of allowing an old conversation to operate on the new
         // binding.
+        // Preserve a provisional transport's context when conversation metadata
+        // first arrives after binding. Do not copy or recreate its ToolContext.
+        let bound_transport = transport_canonical
+            .as_ref()
+            .filter(|key| {
+                openai_canonical.is_none()
+                    && transport.as_ref() == Some(*key)
+                    && bindings.contains_key(*key)
+                    && !aliases
+                        .iter()
+                        .any(|(alias_key, alias)| alias_key != *key && alias.canonical_key == **key)
+            })
+            .cloned();
         let canonical = openai_canonical
+            .or(bound_transport)
             .or_else(|| openai.clone())
             .or(transport_canonical)
             .or_else(|| transport.clone())
@@ -1614,6 +1636,74 @@ mod tests {
             )
             .expect_err("conflicting aliases");
         assert_eq!(error["error"]["code"], "session_identity_conflict");
+    }
+
+    #[test]
+    fn session_reconciliation_accepts_empty_transport_rotations() {
+        let workspace = tempfile::tempdir().expect("workspace");
+        let host = profile(workspace.path(), "host", true, vec!["host".into()]);
+        let router = GatewayRouter::from_profiles(host, vec![]);
+        let initial = router
+            .resolve_session_identity(
+                SessionIdentifiers {
+                    openai: Some("conversation".into()),
+                    transport: Some("initial".into()),
+                },
+                true,
+            )
+            .unwrap();
+        router.select_workspace(&initial.key, "host");
+        let context = router.bindings.lock().unwrap()[&initial.key]
+            .context
+            .clone();
+        for _ in 0..3 {
+            let fresh = router
+                .resolve_session_identity(SessionIdentifiers::default(), true)
+                .unwrap();
+            let resolved = router
+                .resolve_session_identity(
+                    SessionIdentifiers {
+                        openai: Some("conversation".into()),
+                        transport: fresh.transport_id,
+                    },
+                    false,
+                )
+                .expect("empty transport may attach to existing conversation");
+            assert_eq!(resolved.key, initial.key);
+            assert!(Arc::ptr_eq(
+                &context,
+                &router.bindings.lock().unwrap()[&resolved.key].context
+            ));
+        }
+    }
+
+    #[test]
+    fn session_reconciliation_preserves_provisional_binding() {
+        let workspace = tempfile::tempdir().expect("workspace");
+        let host = profile(workspace.path(), "host", true, vec!["host".into()]);
+        let router = GatewayRouter::from_profiles(host, vec![]);
+        let initial = router
+            .resolve_session_identity(SessionIdentifiers::default(), true)
+            .unwrap();
+        router.select_workspace(&initial.key, "host");
+        let context = router.bindings.lock().unwrap()[&initial.key]
+            .context
+            .clone();
+        let resolved = router
+            .resolve_session_identity(
+                SessionIdentifiers {
+                    openai: Some("conversation".into()),
+                    transport: initial.transport_id,
+                },
+                false,
+            )
+            .unwrap();
+        assert_eq!(resolved.key, initial.key);
+        assert!(Arc::ptr_eq(
+            &context,
+            &router.bindings.lock().unwrap()[&resolved.key].context
+        ));
+        assert_eq!(router.selected_workspace_id(&resolved.key), "host");
     }
 
     #[test]
