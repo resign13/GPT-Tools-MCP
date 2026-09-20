@@ -1,0 +1,32 @@
+{
+  "layout": "parent-child",
+  "subspecs": [
+    {
+      "id": "session-identity-routing",
+      "title": "Conversation identity and automatic workspace binding",
+      "fr": ["FR-1"]
+    },
+    {
+      "id": "gateway-binding-contract",
+      "title": "Gateway bind API and strict session lock",
+      "fr": ["FR-2"],
+      "dependsOn": ["session-identity-routing"]
+    },
+    {
+      "id": "workspace-concurrency-isolation",
+      "title": "Concurrent routing and per-workspace serialization",
+      "fr": ["FR-3"],
+      "dependsOn": ["gateway-binding-contract"]
+    },
+    {
+      "id": "compatibility-tests-docs",
+      "title": "Compatibility, prompts, tests, and release gates",
+      "fr": ["FR-4"],
+      "dependsOn": [
+        "session-identity-routing",
+        "gateway-binding-contract",
+        "workspace-concurrency-isolation"
+      ]
+    }
+  ]
+}

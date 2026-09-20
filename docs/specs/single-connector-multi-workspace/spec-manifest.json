@@ -1,0 +1,9 @@
+{
+  "layout": "parent-child",
+  "subspecs": [
+    { "id": "gateway-model-ui", "title": "Gateway model and UI", "fr": ["FR-1", "FR-5"] },
+    { "id": "mcp-session-routing", "title": "MCP session routing", "fr": ["FR-2"], "dependsOn": ["gateway-model-ui"] },
+    { "id": "gateway-tools-security", "title": "Gateway tools and security", "fr": ["FR-3", "FR-4"], "dependsOn": ["mcp-session-routing"] },
+    { "id": "compatibility-tests-release", "title": "Compatibility tests and release", "fr": ["FR-6"], "dependsOn": ["gateway-model-ui", "mcp-session-routing", "gateway-tools-security"] }
+  ]
+}

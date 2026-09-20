@@ -1,0 +1,628 @@
+mod common;
+
+use std::fs;
+use std::process::Command;
+
+use coding_tools_mcp_desktop_lib::tools::list_tools_for_profile;
+use common::*;
+use serde_json::{json, Value};
+
+#[cfg(windows)]
+const TEST_PYTHON: &str = "python";
+#[cfg(not(windows))]
+const TEST_PYTHON: &str = "python3";
+
+#[test]
+fn server_info_returns_workspace_and_tools() {
+    let fx = tiny_js_fixture();
+    let ctx = ctx_for(&fx.root);
+    let out = invoke(&ctx, "server_info", json!({}));
+    let payload = assert_ok(&out);
+    assert_eq!(payload["server"], "coding-tools-mcp");
+    assert_eq!(payload["version"], env!("CARGO_PKG_VERSION"));
+    assert!(payload["tools"].is_array());
+    assert!(payload["tool_count"].as_u64().unwrap_or(0) > 0);
+}
+
+#[test]
+fn read_file_happy_path() {
+    let fx = tiny_js_fixture();
+    let ctx = ctx_for(&fx.root);
+    let out = invoke(&ctx, "read_file", json!({"path": "src/math.js"}));
+    let payload = assert_ok(&out);
+    assert_eq!(payload["path"], "src/math.js");
+    assert_eq!(payload["encoding"], "utf-8");
+}
+
+#[test]
+fn unknown_tool_is_validation_error() {
+    let fx = tiny_js_fixture();
+    let ctx = ctx_for(&fx.root);
+    let out = invoke(&ctx, "definitely_not_a_tool", json!({}));
+    let err = assert_err(&out);
+    assert_eq!(err["error"]["code"], "INVALID_ARGUMENT");
+    assert_eq!(err["error"]["category"], "validation");
+}
+
+#[test]
+fn read_file_explicit_parent_path_is_read_only() {
+    let fx = malicious_fixture();
+    let ctx = ctx_for(&fx.root);
+    let out = invoke(&ctx, "read_file", json!({"path": "../outside-secret.txt"}));
+    let result = assert_ok(&out);
+    assert!(result["content"]
+        .as_str()
+        .unwrap_or("")
+        .contains("TOP_SECRET"));
+}
+
+#[test]
+fn request_permissions_auto_grants_in_default_mode() {
+    let fx = tiny_js_fixture();
+    let ctx = ctx_for(&fx.root);
+    let out = invoke(
+        &ctx,
+        "request_permissions",
+        json!({
+            "tool_name": "exec_command",
+            "permission": "network",
+            "reason": "verify automatic approval",
+            "arguments": {"cmd": "curl https://example.com"}
+        }),
+    );
+    let payload = assert_ok(&out);
+    assert_eq!(payload["status"], "granted");
+    assert_eq!(payload["mode"], "default");
+    assert_eq!(payload["desktop_approval_required"], false);
+    assert_eq!(payload["sandbox_bypass"], false);
+    assert!(payload.get("approval_id").is_none());
+}
+
+#[test]
+fn request_permissions_retries_without_creating_desktop_approval() {
+    let fx = tiny_js_fixture();
+    let ctx = ctx_for(&fx.root);
+    let args = json!({
+        "tool_name": "exec_command",
+        "permission": "network",
+        "reason": "run the requested integration check",
+        "arguments": {"cmd": "curl https://example.com"},
+        "client_request_id": "request-1"
+    });
+    let first = invoke(&ctx, "request_permissions", args.clone());
+    assert_ok(&first);
+    assert_eq!(first["status"], "granted");
+    assert!(first.get("approval_id").is_none());
+    let second = invoke(&ctx, "request_permissions", args);
+    assert_ok(&second);
+    assert_eq!(second, first);
+
+    let missing = invoke(&ctx, "get_approval_status", json!({"approval_id": "old-id"}));
+    assert_err(&missing);
+    assert_eq!(missing["error"]["code"], "APPROVAL_NOT_FOUND");
+}
+
+#[test]
+fn request_permissions_exposes_public_schema_and_grants_in_full_access_mode() {
+    let tools = list_tools_for_profile("core");
+    let tool = tools
+        .iter()
+        .find(|tool| tool["name"] == "request_permissions")
+        .expect("request_permissions descriptor");
+    let schema = &tool["inputSchema"];
+    assert_eq!(
+        schema["required"],
+        json!(["tool_name", "permission", "reason", "arguments"])
+    );
+    assert!(schema["properties"]["permission"]["enum"]
+        .as_array()
+        .expect("permission enum")
+        .contains(&json!("network")));
+
+    let fx = tiny_js_fixture();
+    let mut ctx = ctx_for(&fx.root);
+    ctx.policy.permissions = coding_tools_mcp_desktop_lib::tools::policy::ExecutionPolicy::from_config(
+        "full_access", 1, Default::default(),
+    ).unwrap();
+    let args = json!({
+        "tool_name": "exec_command",
+        "permission": "network",
+        "reason": "verify dangerous-mode compatibility",
+        "arguments": {"cmd": "curl https://example.com"}
+    });
+    let out = invoke(&ctx, "request_permissions", args.clone());
+    let payload = assert_ok(&out);
+    assert_eq!(payload["status"], "granted");
+    assert_eq!(payload["mode"], "full_access");
+    assert_eq!(payload["sandbox_bypass"], false);
+}
+
+#[test]
+fn automatic_approval_exec_succeeds_with_a_stale_approval_id() {
+    let fx = tiny_js_fixture();
+    let cmd = format!("{TEST_PYTHON} -c \"print('approval-ok')\"");
+    for preset in ["default", "full_access"] {
+        let mut ctx = ctx_for(&fx.root);
+        ctx.policy.permissions = coding_tools_mcp_desktop_lib::tools::policy::ExecutionPolicy::from_config(
+            preset, 1, Default::default(),
+        ).unwrap();
+        for approval_id in [None, Some("expired-desktop-approval")] {
+            let mut args = json!({
+                "cmd": cmd,
+                "env": {"BUILD_MODE": "debug"},
+                "yield_time_ms": 10000
+            });
+            if let Some(id) = approval_id {
+                args["approval_id"] = json!(id);
+            }
+            let out = invoke(&ctx, "exec_command", args);
+            let result = assert_ok(&out);
+            assert_eq!(result["exit_code"], 0, "{out}");
+            assert_eq!(result["command_ok"], true, "{out}");
+            assert_eq!(result["child_process"], true);
+            assert!(result["stdout"].as_str().unwrap().contains("approval-ok"));
+        }
+    }
+}
+
+#[test]
+fn check_exec_environment_reports_policy_metadata() {
+    let fx = tiny_js_fixture();
+    let ctx = ctx_for(&fx.root);
+    let out = invoke(&ctx, "check_exec_environment", json!({}));
+    let payload = assert_ok(&out);
+    assert_eq!(payload["permission_mode"], "default");
+    assert_eq!(payload["desktop_approval_required"], false);
+    assert!(payload["allowed_commands"].is_array());
+}
+
+#[test]
+fn permission_status_reports_canonical_mode_and_isolation_capabilities() {
+    let fx = tiny_js_fixture();
+    let ctx = ctx_for(&fx.root);
+    let out = invoke(&ctx, "permission_status", json!({}));
+    let payload = assert_ok(&out);
+    assert_eq!(payload["permission_mode"], "default");
+    assert_eq!(payload["configured_permission_mode"], "default");
+    assert_eq!(payload["desktop_approval_required"], false);
+    assert_eq!(payload["sandbox_bypass"], false);
+    assert!(payload["isolation_backend"].is_string());
+    assert!(payload["isolation_capabilities"]["read"]["mode"].is_string());
+    assert!(payload["isolation_capabilities"]["write"]["mode"].is_string());
+    assert!(payload["isolation_capabilities"]["network"]["mode"].is_string());
+    assert!(payload["permission_policy"].get("legacy").is_none());
+    let server = invoke(&ctx, "server_info", json!({}));
+    assert_eq!(assert_ok(&server)["desktop_approval_required"], false);
+}
+
+#[test]
+fn full_access_removes_soft_approval_without_removing_scope_checks() {
+    let fx = tiny_js_fixture();
+    let mut ctx = ctx_for(&fx.root);
+    ctx.policy.permissions = coding_tools_mcp_desktop_lib::tools::policy::ExecutionPolicy::from_config(
+        "full_access", 1, Default::default(),
+    )
+    .unwrap();
+
+    let out = invoke(
+        &ctx,
+        "exec_command",
+        json!({"cmd": "custom-tool --flag"}),
+    );
+    assert_ne!(out["status"], "approval_required");
+}
+
+#[test]
+fn full_access_permission_request_still_requires_a_matching_capability() {
+    let fx = tiny_js_fixture();
+    let mut ctx = ctx_for(&fx.root);
+    ctx.policy.permissions = coding_tools_mcp_desktop_lib::tools::policy::ExecutionPolicy::from_config(
+        "full_access", 1, Default::default(),
+    )
+    .unwrap();
+
+    let out = invoke(
+        &ctx,
+        "request_permissions",
+        json!({
+            "tool_name": "exec_command",
+            "permission": "network",
+            "arguments": {"cmd": "echo local"}
+        }),
+    );
+    assert_err(&out);
+    assert_eq!(out["error"]["code"], "PERMISSION_CAPABILITY_MISMATCH");
+}
+
+#[test]
+fn default_cwd_is_used_by_file_and_native_exec_tools() {
+    let fx = tiny_js_fixture();
+    let ctx = ctx_for(&fx.root);
+    assert_ok(&invoke(&ctx, "set_default_cwd", json!({"path": "src"})));
+
+    let file_result = invoke(&ctx, "read_file", json!({"path": "math.js"}));
+    let file = assert_ok(&file_result);
+    assert_eq!(file["path"], "src/math.js");
+
+    let pwd_result = invoke(&ctx, "exec_command", json!({"cmd": "pwd"}));
+    let pwd = assert_ok(&pwd_result);
+    assert!(pwd["stdout"].as_str().unwrap_or("").contains("src"));
+}
+
+#[test]
+fn git_log_root_does_not_pass_empty_pathspec() {
+    let temp = tempfile::tempdir().expect("创建临时目录");
+    let workspace = temp.path().join("repo");
+    fs::create_dir_all(&workspace).expect("创建仓库目录");
+    fs::write(workspace.join("README.md"), "初始内容\n").expect("写入文件");
+
+    for args in [
+        vec!["init", "-q"],
+        vec!["config", "user.email", "test@example.com"],
+        vec!["config", "user.name", "测试用户"],
+        vec!["add", "README.md"],
+        vec!["commit", "-q", "-m", "初始化"],
+    ] {
+        let output = Command::new("git")
+            .current_dir(&workspace)
+            .args(args)
+            .output()
+            .expect("执行 git");
+        assert!(output.status.success(), "git 命令失败: {:?}", output);
+    }
+
+    let ctx = ctx_for(&workspace);
+    let result = invoke(&ctx, "git_log", json!({"path": ".", "max_count": 3}));
+    let payload = assert_ok(&result);
+    assert_eq!(payload["is_repo"], true);
+    assert_eq!(payload["commits"].as_array().unwrap().len(), 1);
+    for commit in payload["commits"].as_array().unwrap() {
+        for field in [
+            "hash",
+            "short_hash",
+            "author_name",
+            "author_email",
+            "author_date",
+            "subject",
+        ] {
+            assert_eq!(
+                commit[field].as_str().unwrap(),
+                commit[field].as_str().unwrap().trim()
+            );
+        }
+    }
+}
+
+#[test]
+fn advanced_profile_exposes_every_declared_tool() {
+    let declared = coding_tools_mcp_desktop_lib::tools::registry::P0_TOOLS
+        .iter()
+        .map(|(name, ..)| *name)
+        .collect::<std::collections::HashSet<_>>();
+    let tool_values = coding_tools_mcp_desktop_lib::tools::list_tools_for_profile("advanced");
+    let exposed = tool_values
+        .iter()
+        .filter_map(|tool| tool["name"].as_str())
+        .collect::<std::collections::HashSet<_>>();
+
+    assert_eq!(declared, exposed);
+    assert!(declared
+        .iter()
+        .all(|name| coding_tools_mcp_desktop_lib::tools::is_allowed_tool(name)));
+}
+
+#[test]
+fn core_profile_keeps_the_default_capabilities_and_adds_history_tools() {
+    let tools = coding_tools_mcp_desktop_lib::tools::list_tools_for_profile("core");
+    let names = tools
+        .iter()
+        .filter_map(|tool| tool["name"].as_str())
+        .collect::<std::collections::HashSet<_>>();
+    let expected = coding_tools_mcp_desktop_lib::tools::registry::CORE_TOOLS
+        .iter()
+        .copied()
+        .collect::<std::collections::HashSet<_>>();
+    assert_eq!(names, expected);
+    assert_eq!(names.len(), 28);
+    assert!(names.contains("grep_text"));
+    assert!(names.contains("history_session_bootstrap"));
+    assert!(names.contains("history_session_checkpoint"));
+    assert!(names.contains("history_session_validate"));
+    assert!(names.contains("history_session_search"));
+    assert!(names.contains("history_session_read"));
+    assert!(names.contains("get_approval_status"));
+    assert!(names.contains("permission_status"));
+    assert!(!names.contains("harness_status"));
+    assert!(!names.contains("start_task"));
+}
+
+#[test]
+fn exec_health_check_reports_worker_and_pipe_status() {
+    let fx = tiny_js_fixture();
+    let ctx = ctx_for(&fx.root);
+    let out = invoke(&ctx, "exec_health_check", json!({}));
+    let payload = assert_ok(&out);
+    assert_eq!(payload["worker"]["alive"], true);
+    assert_eq!(payload["session_create"], true);
+    assert_eq!(payload["command_run"], true);
+    assert_eq!(payload["stdout_capture"], true);
+    assert_eq!(payload["stderr_capture"], true);
+}
+
+#[test]
+fn native_diagnostics_support_pwd_and_ls_without_a_shell() {
+    let fx = tiny_js_fixture();
+    let ctx = ctx_for(&fx.root);
+
+    let pwd_result = invoke(&ctx, "exec_command", json!({"cmd": "pwd"}));
+    let pwd = assert_ok(&pwd_result);
+    assert_eq!(pwd["command"], "pwd");
+    assert!(pwd["stdout"]
+        .as_str()
+        .unwrap_or("")
+        .contains("tiny-js-project"));
+    assert_eq!(pwd["execution_mode"], "native_builtin");
+    assert_eq!(pwd["harness_mode"], "standalone");
+    assert_eq!(pwd["task_required"], false);
+    assert_eq!(pwd["command_runner"], "native_builtin");
+    assert_eq!(pwd["status"], "exited");
+    assert_eq!(pwd["exit_code"], 0);
+    assert_eq!(pwd["transport_ok"], true);
+    assert_eq!(pwd["command_ok"], true);
+    assert_eq!(pwd["duration_ms"], 0);
+    assert_eq!(pwd["elapsed_ms"], 0);
+    assert!(pwd["stdout"].is_string());
+    assert_eq!(pwd["stderr"], "");
+
+    let ls_result = invoke(&ctx, "exec_command", json!({"cmd": "ls"}));
+    let ls = assert_ok(&ls_result);
+    assert!(ls["stdout"].as_str().unwrap_or("").contains("src"));
+    assert_eq!(ls["exit_code"], 0);
+}
+
+#[test]
+fn direct_exec_uses_the_same_result_contract() {
+    let fx = tiny_js_fixture();
+    let ctx = ctx_for(&fx.root);
+    let result = invoke(
+        &ctx,
+        "exec_command",
+        json!({"cmd": format!("{TEST_PYTHON} --version"), "filesystem_scope": "workspace"}),
+    );
+    let payload = assert_ok(&result);
+
+    assert_eq!(payload["command"], format!("{TEST_PYTHON} --version"));
+    assert_eq!(payload["execution_mode"], "direct");
+    assert_eq!(payload["harness_mode"], "standalone");
+    assert_eq!(payload["task_required"], false);
+    assert_eq!(payload["status"], "exited");
+    assert_eq!(payload["exit_code"], 0);
+    assert!(payload["stdout"].is_string());
+    assert!(payload["stderr"].is_string());
+    assert!(payload["duration_ms"].is_u64());
+    assert_eq!(payload["duration_ms"], payload["elapsed_ms"]);
+    assert_eq!(payload["transport_ok"], true);
+    assert_eq!(payload["command_ok"], true);
+}
+
+#[test]
+fn nonzero_command_exit_keeps_transport_ok_but_sets_command_ok_false() {
+    let fx = tiny_js_fixture();
+    let ctx = ctx_for(&fx.root);
+    let result = invoke(
+        &ctx,
+        "exec_command",
+        json!({
+            "cmd": format!("{TEST_PYTHON} -c \"import sys; sys.exit(1)\""),
+            "filesystem_scope": "workspace"
+        }),
+    );
+    let payload = assert_ok(&result);
+
+    assert_eq!(payload["ok"], true);
+    assert_eq!(payload["transport_ok"], true);
+    assert_eq!(payload["command_ok"], false);
+    assert_eq!(payload["status"], "exited");
+    assert_eq!(payload["exit_code"], 1);
+}
+
+#[test]
+fn retained_session_timeout_stops_the_process_after_deadline() {
+    let fx = tiny_js_fixture();
+    let ctx = ctx_for(&fx.root);
+    let result = invoke(
+        &ctx,
+        "exec_command",
+        json!({
+            "cmd": format!("{TEST_PYTHON} -c \"import time; time.sleep(2)\""),
+            "filesystem_scope": "workspace",
+            "timeout_ms": 100,
+            "yield_time_ms": 0
+        }),
+    );
+    let payload = assert_ok(&result);
+    assert_eq!(payload["status"], "running");
+    assert_eq!(payload["transport_ok"], true);
+    assert_eq!(payload["command_ok"], Value::Null);
+    assert_eq!(payload["stdin_open"], true);
+    let session_id = payload["session_id"].as_str().expect("session id");
+
+    std::thread::sleep(std::time::Duration::from_millis(250));
+    let after = invoke(
+        &ctx,
+        "write_stdin",
+        json!({"session_id": session_id, "chars": ""}),
+    );
+    assert_eq!(after["termination_reason"], "timeout");
+    assert_eq!(after["status"], "exited");
+    assert_eq!(after["transport_ok"], true);
+    assert_eq!(after["command_ok"], false);
+    assert_eq!(after["stdin_open"], false);
+    #[cfg(unix)]
+    assert_eq!(after["exit_code"], Value::Null);
+}
+
+#[test]
+fn killed_session_reports_command_failure_even_when_transport_succeeds() {
+    let fx = tiny_js_fixture();
+    let ctx = ctx_for(&fx.root);
+    let result = invoke(
+        &ctx,
+        "exec_command",
+        json!({
+            "cmd": format!("{TEST_PYTHON} -c \"import time; time.sleep(2)\""),
+            "filesystem_scope": "workspace",
+            "timeout_ms": 10_000,
+            "yield_time_ms": 0
+        }),
+    );
+    let payload = assert_ok(&result);
+    let session_id = payload["session_id"].as_str().expect("session id");
+
+    let killed = invoke(
+        &ctx,
+        "kill_session",
+        json!({"session_id": session_id, "wait_ms": 2_000}),
+    );
+    let killed = assert_ok(&killed);
+    assert_eq!(killed["status"], "killed");
+    assert_eq!(killed["killed"], true);
+    assert_eq!(killed["transport_ok"], true);
+    assert_eq!(killed["command_ok"], false);
+    #[cfg(unix)]
+    assert_eq!(killed["exit_code"], Value::Null);
+}
+
+#[test]
+fn list_files_accepts_glob_alias() {
+    let fx = tiny_js_fixture();
+    let ctx = ctx_for(&fx.root);
+    let out = invoke(
+        &ctx,
+        "list_files",
+        json!({"glob": "**/*.js", "max_results": 10}),
+    );
+    let payload = assert_ok(&out);
+    let files = payload["files"].as_array().expect("files array");
+    assert!(!files.is_empty());
+    assert!(files
+        .iter()
+        .all(|f| f["path"].as_str().unwrap_or("").ends_with(".js")));
+}
+
+#[test]
+fn search_text_filters_by_glob() {
+    let fx = tiny_js_fixture();
+    let ctx = ctx_for(&fx.root);
+    let hit = invoke(
+        &ctx,
+        "search_text",
+        json!({"query": "function add", "glob": "**/*.js", "max_results": 10}),
+    );
+    let hit_payload = assert_ok(&hit);
+    assert!(hit_payload["total_matches"].as_u64().unwrap_or(0) > 0);
+
+    let miss = invoke(
+        &ctx,
+        "search_text",
+        json!({"query": "function add", "glob": "**/*.py"}),
+    );
+    let miss_payload = assert_ok(&miss);
+    assert_eq!(miss_payload["total_matches"].as_u64().unwrap_or(1), 0);
+}
+
+#[test]
+fn search_text_skips_binary_and_oversized_files() {
+    let fx = tiny_js_fixture();
+    let ctx = ctx_for(&fx.root);
+
+    // Fixture materializes assets/raw.bin with NUL bytes; must not match or thrash.
+    let binary = invoke(
+        &ctx,
+        "search_text",
+        json!({"query": "binary", "glob": "assets/**", "max_results": 10}),
+    );
+    let binary_payload = assert_ok(&binary);
+    assert_eq!(binary_payload["total_matches"].as_u64().unwrap_or(1), 0);
+    assert!(binary_payload["skipped_binary_files"].as_u64().unwrap_or(0) >= 1);
+
+    // Oversized text file is skipped by max_file_bytes without being fully loaded.
+    let large_path = fx.root.join("search/huge.txt");
+    fs::write(&large_path, format!("needle {}\n", "x".repeat(4096))).expect("write huge");
+    let oversized = invoke(
+        &ctx,
+        "search_text",
+        json!({
+            "query": "needle",
+            "glob": "search/huge.txt",
+            "max_file_bytes": 64,
+            "max_results": 10
+        }),
+    );
+    let oversized_payload = assert_ok(&oversized);
+    assert_eq!(oversized_payload["total_matches"].as_u64().unwrap_or(1), 0);
+    assert!(
+        oversized_payload["skipped_large_files"]
+            .as_u64()
+            .unwrap_or(0)
+            >= 1
+    );
+    assert!(oversized_payload["warnings"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .any(|w| w.as_str().unwrap_or("").contains("max_file_bytes")));
+}
+
+#[test]
+fn search_text_stops_after_max_results() {
+    let fx = tiny_js_fixture();
+    let ctx = ctx_for(&fx.root);
+    let out = invoke(
+        &ctx,
+        "search_text",
+        json!({"query": "common-token", "glob": "search/**", "max_results": 2}),
+    );
+    let payload = assert_ok(&out);
+    assert_eq!(
+        payload["matches"].as_array().map(|a| a.len()).unwrap_or(0),
+        2
+    );
+    assert!(payload["truncated"].as_bool().unwrap_or(false));
+    assert!(payload["warnings"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .any(|w| w.as_str().unwrap_or("").contains("result limit reached")));
+}
+
+#[test]
+fn grep_reuses_search_text_schema_and_behavior() {
+    let schema = coding_tools_mcp_desktop_lib::tools::registry::input_schema("grep");
+    assert_eq!(
+        schema,
+        coding_tools_mcp_desktop_lib::tools::registry::input_schema("search_text")
+    );
+
+    let fx = tiny_js_fixture();
+    let ctx = ctx_for(&fx.root);
+    assert_ok(&invoke(&ctx, "set_default_cwd", json!({"path": "src"})));
+    let output = invoke(
+        &ctx,
+        "grep",
+        json!({
+            "query": "function\\s+add",
+            "path": ".",
+            "glob": "**/*.js",
+            "regex": true,
+            "case_sensitive": true,
+            "max_results": 10
+        }),
+    );
+    let payload = assert_ok(&output);
+    let matches = payload["matches"].as_array().expect("matches array");
+    assert!(!matches.is_empty());
+    assert!(matches
+        .iter()
+        .all(|item| item["path"].as_str().unwrap_or("").starts_with("src/")));
+}
